@@ -1,64 +1,104 @@
-import pandas as pd
-import xgboost as xgb
+import os
 import joblib
+import numpy as np
+import xgboost as xgb
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 
-# 1. Load the Data
-print("Loading dataset...")
-df = pd.read_csv("simulation_data.csv")
+from prediction_data import build_dataset
 
-# 2. Preprocess the Data
-# We drop 'timestamp' and 'node_id' because we want the model to learn 
-# the physics of a leak, not memorize specific times or node names.
-X = df.drop(columns=['timestamp', 'node_id', 'is_leaking'])
-y = df['is_leaking']
 
-# 3. Handle the Imbalanced Data (Crucial Step)
-# We need to tell XGBoost to care more about the rare '1's (leaks).
-# We do this by calculating the ratio of normal rows to leak rows.
-num_negative_samples = (y == 0).sum()
-num_positive_samples = (y == 1).sum()
+# ---------------- CONFIG ----------------
+# Option 1: set path directly here
+DEFAULT_DATA_ROOT = "./Net1OK"
 
-if num_positive_samples == 0:
-    raise ValueError("No leaks found in your dataset yet! Let the simulation run longer.")
+# Option 2: or use environment variable NET1_DATA_ROOT
+MODEL_OUT = "detection.pkl"
+# ----------------------------------------
 
-scale_weight = num_negative_samples / num_positive_samples
-print(f"Data balance - Normal: {num_negative_samples}, Leaks: {num_positive_samples}")
-print(f"Applying scale_pos_weight of: {scale_weight:.2f}")
 
-# 4. Split into Training and Testing sets (80% train, 20% test)
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+def main() -> None:
+    # Resolve data root
+    data_root = os.environ.get("NET1_DATA_ROOT", DEFAULT_DATA_ROOT).strip()
 
-# 5. Initialize the XGBoost Model
-# We pass the scale_weight here so the model penalizes itself heavily if it misses a leak
-model = xgb.XGBClassifier(
-    n_estimators=100,
-    learning_rate=0.1,
-    max_depth=5,
-    scale_pos_weight=scale_weight,
-    random_state=42,
-    eval_metric='logloss'
-)
+    if not data_root:
+        raise ValueError(
+            "Data root not set. Either:\n"
+            "1) Set NET1_DATA_ROOT env variable, or\n"
+            "2) Edit DEFAULT_DATA_ROOT in the script."
+        )
 
-# 6. Train the Model
-print("Training the XGBoost model...")
-model.fit(X_train, y_train)
+    if not os.path.isdir(data_root):
+        raise FileNotFoundError(f"Data root directory does not exist: {data_root}")
 
-# 7. Evaluate the Model
-print("\n--- Model Evaluation ---")
-y_pred = model.predict(X_test)
+    print(f"Loading detection dataset from: {data_root}")
 
-# A confusion matrix shows True Positives, False Positives, etc.
-print("Confusion Matrix:")
-print(confusion_matrix(y_test, y_pred))
+    # Each row = single timestamp snapshot (no temporal modeling)
+    df, X, y = build_dataset(base_dir=data_root, horizon_steps=0)
 
-# The classification report shows Precision, Recall, and F1-Score
-print("\nClassification Report:")
-print(classification_report(y_test, y_pred))
+    print(f"Feature matrix shape: {X.shape}")
+    print(f"Labels shape: {y.shape}")
 
-# 8. Save the Model
-# We save the trained model as a file so your FastAPI app can use it later
-model_filename = "xgboost_leak_model.pkl"
-joblib.dump(model, model_filename)
-print(f"\nModel saved successfully as '{model_filename}'")
+    unique, counts = np.unique(y, return_counts=True)
+    print("Class balance (0 = no leak, 1 = leak):")
+    for label, count in zip(unique, counts):
+        print(f"  {label}: {count}")
+
+    if len(unique) < 2 or 1 not in unique:
+        raise ValueError(
+            "No positive (leak) samples found. "
+            "Check Labels.csv files for Label > 0."
+        )
+
+    # Train / test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.2,
+        random_state=42,
+        stratify=y,
+    )
+
+    n_neg = int((y_train == 0).sum())
+    n_pos = int((y_train == 1).sum())
+
+    if n_pos == 0:
+        raise ValueError("No positive samples in training split.")
+
+    scale_pos_weight = n_neg / n_pos
+
+    print(f"Training samples → normal: {n_neg}, leak: {n_pos}")
+    print(f"Using scale_pos_weight = {scale_pos_weight:.2f}")
+
+    # XGBoost single-instance detector
+    model = xgb.XGBClassifier(
+        n_estimators=150,
+        learning_rate=0.08,
+        max_depth=6,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        scale_pos_weight=scale_pos_weight,
+        random_state=42,
+        eval_metric="logloss",
+        n_jobs=-1,
+    )
+
+    print("Training XGBoost leak detection model...")
+    model.fit(X_train, y_train)
+
+    print("\n--- Detection Model Evaluation ---")
+    y_pred = model.predict(X_test)
+
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_test, y_pred))
+
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred, digits=3))
+
+    joblib.dump(model, MODEL_OUT)
+    print(f"\nDetection model saved as '{MODEL_OUT}'")
+
+
+if __name__ == "__main__":
+    main()

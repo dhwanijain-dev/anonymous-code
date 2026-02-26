@@ -19,10 +19,15 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Override and always use the original BIWS.inp network for live simulation.
 INP_FILE = os.path.join(BASE_DIR, "BIWS.inp")
+
 HTML_FILE = os.path.join(BASE_DIR, "../frontend/dashboard.html")
-CSV_FILE = os.path.join(BASE_DIR, "simulation_data.csv")
-MODEL_FILE = os.path.join(BASE_DIR, "model", "xgboost_leak_model.pkl")
+
+# Pre-trained models (provided separately)
+DETECTION_MODEL_FILE = os.path.join(BASE_DIR, "model", "detection.pkl")
+PREDICTION_MODEL_FILE = os.path.join(BASE_DIR, "model", "prediction.pkl")
 
 # ============================
 # APP
@@ -46,13 +51,23 @@ wn_init = wntr.network.WaterNetworkModel(INP_FILE)
 node_physical_props = {}
 pipe_physical_props = {}
 
+# Detection model (current leak classification)
 leak_model = None
 try:
-    leak_model = joblib.load(MODEL_FILE)
-    print(f"Loaded XGBoost model from: {MODEL_FILE}")
+    leak_model = joblib.load(DETECTION_MODEL_FILE)
+    print(f"Loaded detection model from: {DETECTION_MODEL_FILE}")
 except Exception as e:
-    print(f"WARNING: Failed to load leak model at {MODEL_FILE}: {e}")
+    print(f"WARNING: Failed to load detection model at {DETECTION_MODEL_FILE}: {e}")
     leak_model = None
+
+# Prediction model (future leak forecasting at network level)
+prediction_model = None
+try:
+    prediction_model = joblib.load(PREDICTION_MODEL_FILE)
+    print(f"Loaded prediction model from: {PREDICTION_MODEL_FILE}")
+except Exception as e:
+    print(f"WARNING: Failed to load prediction model at {PREDICTION_MODEL_FILE}: {e}")
+    prediction_model = None
 
 for node in wn_init.junction_name_list:
     node_physical_props[node] = {
@@ -390,6 +405,34 @@ def simulation_worker():
             pipe_y_true = [int(e.get("is_leaking", 0)) for e in graph_edges if e.get("pred_is_leaking") is not None]
             pipe_y_pred = [int(e.get("pred_is_leaking", 0)) for e in graph_edges if e.get("pred_is_leaking") is not None]
 
+            # Optional: use prediction_model for network-level future leak risk
+            future_prob = None
+            future_flag = None
+            if prediction_model is not None and graph_nodes:
+                try:
+                    pressures = np.array([n["pressure"] for n in graph_nodes], dtype=float)
+                    node_preds = np.array(
+                        [int(n.get("pred_is_leaking", 0)) for n in graph_nodes],
+                        dtype=int,
+                    )
+                    features = {
+                        "pressure_mean": float(pressures.mean()),
+                        "pressure_std": float(pressures.std()),
+                        "pressure_min": float(pressures.min()),
+                        "pressure_max": float(pressures.max()),
+                        "num_nodes": float(len(graph_nodes)),
+                        "frac_nodes_pred_leak": float(node_preds.sum() / len(graph_nodes)),
+                    }
+                    X_future = pd.DataFrame([features])
+                    try:
+                        future_prob = float(prediction_model.predict_proba(X_future)[0, 1])
+                    except Exception:
+                        future_prob = float(prediction_model.predict(X_future)[0])
+                    future_flag = int(future_prob >= 0.5)
+                except Exception as _:
+                    future_prob = None
+                    future_flag = None
+
             snapshot = {
                 "nodes": graph_nodes,
                 "edges": graph_edges,
@@ -397,6 +440,11 @@ def simulation_worker():
                     "nodes": _binary_metrics(node_y_true, node_y_pred),
                     "pipes": _binary_metrics(pipe_y_true, pipe_y_pred),
                     "model_loaded": bool(leak_model is not None),
+                },
+                "prediction": {
+                    "future_leak_prob": future_prob,
+                    "future_leak_flag": future_flag,
+                    "model_loaded": bool(prediction_model is not None),
                 },
                 "timestamp": current_time
             }
