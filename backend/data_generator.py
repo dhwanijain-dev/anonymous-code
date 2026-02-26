@@ -1,133 +1,254 @@
 
-import argparse
 import os
-import random
 import time
+import argparse
+import random
+import copy
+import csv
+from typing import List
+
 import numpy as np
 import wntr
-import warnings
 
-warnings.filterwarnings("ignore", category=UserWarning)  # optional: hide repeated warnings about unused curves
+# -----------------------
+# CLI args
+# -----------------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--inp", type=str, default="BIWS.inp", help="Path to INP file")
+    p.add_argument("--out", type=str, default="simulation_data.csv", help="Output CSV")
+    p.add_argument("--cycles", type=int, default=1000, help="Number of simulation cycles to run")
+    p.add_argument("--mode", choices=["fast", "realistic"], default="fast",
+                   help="fast = EPANET emitter (fastest). realistic = WNTR node.add_leak (pressure-dependent)")
+    p.add_argument("--batch", type=int, default=50, help="Number of cycles per CSV flush")
+    p.add_argument("--seed", type=int, default=None, help="Random seed (optional)")
+    p.add_argument("--leak_scale", type=float, default=0.02,
+                   help="Multiplier on normalized risk score to make leaks more/less frequent. Increase for more leaks.")
+    p.add_argument("--sim_duration", type=int, default=600, help="Simulation duration (seconds) per cycle")
+    return p.parse_args()
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--inp", type=str, default="BIWS.inp", help="Path to EPANET .inp file")
-parser.add_argument("--out", type=str, default="gnn_rf_dataset.npz", help="Output .npz dataset path")
-parser.add_argument("--variations", type=int, default=2, help="Number of leak variations per pipe (>=1)")
-parser.add_argument("--leak_areas", type=float, nargs="*", default=[1e-5, 5e-5, 1e-4], help="Leak orifice areas (m^2) to sample from")
-parser.add_argument("--snapshot_offset", type=int, default=0, help="Seconds after chosen snapshot (unused normally)")
-parser.add_argument("--seed", type=int, default=42)
-args = parser.parse_args()
+# -----------------------
+# Helper: init node physical props
+# -----------------------
+def init_node_physical_props(junctions: List[str], rng: np.random.Generator):
+    props = {}
+    # Use deterministic-ish distributions based on rng
+    ages = rng.uniform(1, 80, size=len(junctions))
+    corrs = rng.uniform(0.1, 1.0, size=len(junctions))
+    lengths = rng.uniform(10, 1000, size=len(junctions))
+    avg_press = rng.uniform(20, 100, size=len(junctions))
+    press_var = rng.uniform(0.5, 10.0, size=len(junctions))
+    soil_corr = rng.uniform(0.1, 1.0, size=len(junctions))
 
-random.seed(args.seed)
-np.random.seed(args.seed)
+    for i, node in enumerate(junctions):
+        props[node] = {
+            "age": float(ages[i]),
+            "corrosion_idx": float(corrs[i]),
+            "length": float(lengths[i]),
+            "avg_pressure": float(avg_press[i]),
+            "press_var": float(press_var[i]),
+            "soil_corr_idx": float(soil_corr[i])
+        }
+    return props
 
-INP_PATH = args.inp
-OUT_PATH = args.out
-VARIATIONS = args.variations
-LEAK_AREAS = list(args.leak_areas)
+# -----------------------
+# Core generator
+# -----------------------
+def generate(
+    inp_file: str,
+    out_csv: str,
+    cycles: int = 1000,
+    mode: str = "fast",
+    batch_size: int = 50,
+    seed: int = None,
+    leak_scale: float = 0.02,
+    sim_duration: int = 600,
+):
+    # RNGs
+    if seed is not None:
+        random.seed(seed)
+        rng = np.random.default_rng(seed)
+    else:
+        rng = np.random.default_rng()
 
-if not os.path.exists(INP_PATH):
-    raise FileNotFoundError(f"INP file not found: {INP_PATH}")
+    # Load base network once
+    wn_base = wntr.network.WaterNetworkModel(inp_file)
 
-print("Loading network with WNTR:", INP_PATH)
-wn_base = wntr.network.WaterNetworkModel(INP_PATH)
+    junctions = wn_base.junction_name_list
+    n_nodes = len(junctions)
+    if n_nodes == 0:
+        raise RuntimeError("No junctions found in the INP file.")
 
-# Run baseline simulation (no leaks)
-print("Running baseline simulation...")
-sim = wntr.sim.EpanetSimulator(wn_base)
-baseline_results = sim.run_sim()
+    # Initialize stable physical props (same as your original approach)
+    node_physical_props = init_node_physical_props(junctions, rng)
 
-# Choose a snapshot time (prefer 1 hour or 1/4 duration if set)
-times = baseline_results.node["pressure"].index.values
-if len(times) == 0:
-    raise RuntimeError("No simulation times returned. Check INP time settings.")
-if wn_base.options.time.duration and wn_base.options.time.duration > 0:
-    chosen_snapshot_time = int(min(max(3600, wn_base.options.time.duration // 4), wn_base.options.time.duration - 1))
-else:
-    chosen_snapshot_time = int(times[len(times) // 2])
-snap_idx = baseline_results.node["pressure"].index.get_indexer([chosen_snapshot_time], method="nearest")[0]
-snapshot_time = baseline_results.node["pressure"].index[snap_idx]
-print("Snapshot time chosen (s):", snapshot_time)
+    # Prepare CSV (header if not exists)
+    header = [
+        "timestamp", "node_id", "age", "corrosion_idx",
+        "length", "baseline_pressure", "press_var",
+        "soil_corr_idx", "current_live_pressure", "is_leaking"
+    ]
+    write_header = not os.path.exists(out_csv)
+    csv_file = open(out_csv, "a", newline="")
+    csv_writer = csv.writer(csv_file)
+    if write_header:
+        csv_writer.writerow(header)
+        csv_file.flush()
 
-# Baseline pressure vector (node order = wn.node_name_list)
-node_names = list(wn_base.node_name_list)
-num_nodes = len(node_names)
-edge_names = list(wn_base.link_name_list)
-num_edges = len(edge_names)
-print(f"Network: nodes={num_nodes}, edges={num_edges}")
+    rows_buffer = []
+    t0 = time.time()
 
-baseline_pressure = baseline_results.node["pressure"].loc[snapshot_time].values.astype(float)
+    # Precompute arrays for vectorized risk score calculation
+    age_arr = np.array([node_physical_props[n]["age"] for n in junctions], dtype=float)
+    corr_arr = np.array([node_physical_props[n]["corrosion_idx"] for n in junctions], dtype=float)
+    length_arr = np.array([node_physical_props[n]["length"] for n in junctions], dtype=float)
+    avgp_arr = np.array([node_physical_props[n]["avg_pressure"] for n in junctions], dtype=float)
+    pv_arr = np.array([node_physical_props[n]["press_var"] for n in junctions], dtype=float)
+    soil_arr = np.array([node_physical_props[n]["soil_corr_idx"] for n in junctions], dtype=float)
 
-# static node attrs (optionally used)
-node_elevations = np.array([wn_base.get_node(n).elevation if hasattr(wn_base.get_node(n), "elevation") else 0.0 for n in node_names], dtype=float)
-node_base_demand = np.array([wn_base.get_node(n).base_demand if hasattr(wn_base.get_node(n), "base_demand") else 0.0 for n in node_names], dtype=float)
+    for cycle in range(1, cycles + 1):
+        cycle_start = time.time()
+        # Use a fresh model copy for each cycle (deepcopy is faster than reloading .inp repeatedly)
+        wn = copy.deepcopy(wn_base)
 
-# Prepare storage
-samples = []          # will store residual vectors (num_nodes,)
-labels = []           # leaking pipe index (0..num_edges-1)
-meta = []             # metadata per sample
+        # Tweak simulation times (shorter durations = faster generation)
+        wn.options.time.duration = sim_duration
+        wn.options.time.hydraulic_timestep = 60
+        wn.options.time.report_timestep = 60
 
-pipe_names = edge_names  # all pipes
+        # 1) demand noise (vectorized-ish)
+        # Loop needed because node.demand may be None or not numeric
+        for n in wn.junction_name_list:
+            node_obj = wn.get_node(n)
+            if node_obj.demand is not None:
+                try:
+                    # small multiplicative noise
+                    noise = rng.uniform(-0.03, 0.05)
+                    node_obj.demand = float(node_obj.demand) * (1.0 + float(noise))
+                except Exception:
+                    pass
 
-total_pipes = len(pipe_names)
-print(f"Will generate {VARIATIONS} variation(s) per pipe -> approx {total_pipes * VARIATIONS} samples")
+        # 2) risk-based leak decision (vectorized)
+        normalized_risk_score = (
+            (age_arr / 80.0) * 0.2 +
+            (corr_arr) * 0.2 +
+            (length_arr / 1000.0) * 0.1 +
+            (avgp_arr / 100.0) * 0.1 +
+            (pv_arr / 10.0) * 0.2 +
+            (soil_arr) * 0.2
+        )  # shape (n_nodes,)
 
-start_time = time.time()
-sample_count = 0
+        # leak_thresholds, scaled by leak_scale CLI arg
+        leak_thresholds = normalized_risk_score * leak_scale  # tweak leak_scale to control freq
 
-for p_idx, pipe_name in enumerate(pipe_names[:500]):
-    for v in range(VARIATIONS):
-        # reload network fresh to avoid carry-over of previous leak
-        wn = wntr.network.WaterNetworkModel(INP_PATH)
-        link = wn.get_link(pipe_name)
-        # choose leak node: start or end node
-        leak_node_name = random.choice([link.start_node_name, link.end_node_name])
-        node_obj = wn.get_node(leak_node_name)
+        random_draws = rng.random(n_nodes)
+        leak_flags = random_draws < leak_thresholds  # boolean array: True => create leak
 
-        # sample leak area randomly
-        leak_area = float(random.choice(LEAK_AREAS))
+        # For bookkeeping: sets for CSV detection
+        leak_nodes_set = set()
 
-        # set leak time so it is active at snapshot_time
-        leak_start = max(1, int(snapshot_time) - 3600)  # 1 hour before
-        leak_end = int(snapshot_time) + 3600             # 1 hour after
+        # Apply leaks (fast vs realistic)
+        if mode == "fast":
+            # EPANET emitters approach (fast)
+            for idx, node_name in enumerate(junctions):
+                if leak_flags[idx]:
+                    try:
+                        wn.get_node(node_name).emitter_coefficient = float(rng.uniform(20, 60))
+                        leak_nodes_set.add(node_name)
+                    except Exception:
+                        pass
+        else:
+            # realistic mode: use WNTR node.add_leak (pressure-dependent). Slower but physical.
+            for idx, node_name in enumerate(junctions):
+                if leak_flags[idx]:
+                    try:
+                        ln = wn.get_node(node_name)
+                        ln.add_leak(
+                            wn,
+                            area=float(rng.uniform(0.0005, 0.003)),
+                            discharge_coeff=0.75,
+                            start_time=0,
+                            end_time=sim_duration
+                        )
+                        # WNTR stores leak_area (or leak params). Use name in bookkeeping
+                        leak_nodes_set.add(node_name)
+                    except Exception:
+                        pass
 
-        # add leak (pressure-dependent)
-        node_obj.add_leak(wn, area=leak_area, start_time=leak_start, end_time=leak_end)
+        # 3) simulate
+        try:
+            if mode == "fast":
+                sim = wntr.sim.EpanetSimulator(wn)
+            else:
+                sim = wntr.sim.WNTRSimulator(wn)
+            results = sim.run_sim()
+        except Exception as ex:
+            # If simulation fails, skip this cycle but log a short message
+            print(f"[Cycle {cycle}] Simulation failed: {ex}")
+            # continue to next cycle
+            continue
 
-        # run simulation
-        sim = wntr.sim.EpanetSimulator(wn)
-        results = sim.run_sim()
+        # get latest pressures (last reported time)
+        try:
+            pressure = results.node["pressure"].iloc[-1]
+        except Exception:
+            # if pressure extraction fails skip cycle
+            print(f"[Cycle {cycle}] Failed to get pressure results, skipping.")
+            continue
 
-        # find nearest time index to snapshot_time in this simulation
-        t_idx = results.node["pressure"].index.get_indexer([snapshot_time], method="nearest")[0]
-        t_snap = results.node["pressure"].index[t_idx]
+        current_time = time.time()
 
-        # extract node pressures and compute residual (pressure_now - baseline)
-        node_press = results.node["pressure"].loc[t_snap].values.astype(float)
-        residual = node_press - baseline_pressure   # shape (num_nodes,)
+        # batch rows for CSV
+        for node_name, live_pressure in pressure.items():
+            node_key = str(node_name).strip()
+            if node_key in node_physical_props:
+                props = node_physical_props[node_key]
+                is_leaking = 1 if node_key in leak_nodes_set else 0
+                rows_buffer.append([
+                    current_time,
+                    node_key,
+                    props["age"],
+                    props["corrosion_idx"],
+                    props["length"],
+                    props["avg_pressure"],
+                    props["press_var"],
+                    props["soil_corr_idx"],
+                    float(live_pressure),
+                    is_leaking
+                ])
 
-        # optional additional features: global stats
-        stats = np.array([residual.mean(), residual.std(), residual.min(), residual.max(), leak_area], dtype=float)
+        # flush buffer in batches to keep memory low and speed high
+        if cycle % batch_size == 0 or cycle == cycles:
+            csv_writer.writerows(rows_buffer)
+            csv_file.flush()
+            rows_buffer.clear()
 
-        # final feature vector: residuals concatenated with a few stats (flatten)
-        feat = np.concatenate([residual, stats])  # length = num_nodes + 5
+        # Optional lightweight progress print (every 100 cycles)
+        if cycle % max(1, cycles // 20) == 0:
+            elapsed = time.time() - t0
+            avg_per_cycle = elapsed / cycle
+            print(f"[{cycle}/{cycles}] elapsed={elapsed:.1f}s avg_cycle={avg_per_cycle:.3f}s total_rows={cycle * n_nodes}")
 
-        samples.append(feat)
-        labels.append(p_idx)
-        meta.append({"leak_pipe": pipe_name, "leak_node": leak_node_name, "leak_area": leak_area, "snapshot_time": int(t_snap)})
+    csv_file.close()
+    total_time = time.time() - t0
+    print(f"Done. Generated ~{cycles * n_nodes} rows in {total_time:.1f}s ({(cycles * n_nodes) / total_time:.1f} rows/s)")
 
-        sample_count += 1
-        if (sample_count % 50) == 0:
-            elapsed = time.time() - start_time
-            print(f"Generated {sample_count} samples, last pipe {pipe_name}, elapsed {elapsed:.1f}s")
+# -----------------------
+# Entrypoint
+# -----------------------
+if __name__ == "__main__":
+    args = parse_args()
+    if args.seed is not None:
+        print(f"Seed: {args.seed}")
+    print(f"Mode: {args.mode} | Cycles: {args.cycles} | Batch: {args.batch} | Leak scale: {args.leak_scale}")
 
-# Convert to arrays and save
-X = np.stack(samples, axis=0).astype(np.float32)  # shape (num_samples, num_nodes+5)
-y = np.array(labels, dtype=np.int32)
-meta_arr = np.array(meta, dtype=object)
-
-np.savez_compressed(OUT_PATH, X=X, y=y, node_names=np.array(node_names, dtype=object),
-                    edge_names=np.array(edge_names, dtype=object), meta=meta_arr)
-
-print("Saved dataset to", OUT_PATH)
-print("Samples:", X.shape[0], "Feature dim:", X.shape[1])
+    generate(
+        inp_file=args.inp,
+        out_csv=args.out,
+        cycles=args.cycles,
+        mode=args.mode,
+        batch_size=args.batch,
+        seed=args.seed,
+        leak_scale=args.leak_scale,
+        sim_duration=args.sim_duration,
+    )
