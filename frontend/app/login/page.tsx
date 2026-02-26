@@ -74,7 +74,7 @@ export default function LoginPage() {
               </div>
             </div>
             <div>
-              <span className="text-3xl font-bold tracking-tight">AquaGuard</span>
+              <span className="text-3xl font-bold tracking-tight">Water Detection System</span>
               <div className="flex items-center gap-1 text-slate-500 text-xs">
                 <Waves className="w-3 h-3" />
                 <span>Smart Water Monitoring</span>

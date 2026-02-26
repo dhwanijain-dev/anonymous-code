@@ -98,12 +98,12 @@ export function Sidebar({ user }: SidebarProps) {
           <Link href="/dashboard" className="flex items-center gap-3 group">
             <div className="relative">
               <div className="absolute inset-0 bg-slate-800/20 blur-xl rounded-full group-hover:bg-slate-800/30 transition-all" />
-              <div className="relative bg-gradient-to-br from-slate-800 to-slate-900 p-2.5 rounded-xl shadow-lg">
-                <Droplet className="w-6 h-6 text-white fill-white" />
+              <div className="relative bg-linear-to-br from-slate-800 to-slate-900 p-2.5 rounded-xl shadow-lg">
+                 <img src="/logo.svg" alt="LeakNet Logo" height={ 10} width={10} />
               </div>
             </div>
             <div>
-              <span className="text-xl font-bold text-slate-900">AquaGuard</span>
+              <span className="text-xl font-bold text-slate-900">LeakNet</span>
               <div className="flex items-center gap-1 text-slate-500 text-xs">
                 <Waves className="w-3 h-3" />
                 <span>Water Monitoring</span>

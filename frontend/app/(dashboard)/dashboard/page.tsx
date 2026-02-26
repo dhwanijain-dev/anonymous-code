@@ -2,11 +2,25 @@
 
 import { useState, useEffect } from 'react';
 import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
-import { AlertCircle, TrendingUp, Droplet, Zap, Activity } from 'lucide-react';
+import { AlertCircle, TrendingUp, Droplet, Zap, Activity, Waves, AlertTriangle } from 'lucide-react';
 import { DashboardMetrics, Alert } from '@/lib/types';
 import { KPICard } from '@/components/dashboard/kpi-card';
 import { AlertFeed } from '@/components/dashboard/alert-feed';
 import { MiniMap } from '@/components/dashboard/mini-map';
+
+// Types for pipeline data
+interface RiskNode {
+  node: string;
+  risk_level: string;
+  pressure: number;
+}
+
+interface PipelineData {
+  nodes: string[];
+  pressure: number[];
+  risk_nodes: RiskNode[];
+  timestamp?: number;
+}
 
 // Mock data
 const mockMetrics: DashboardMetrics = {
@@ -68,6 +82,69 @@ const mockAlerts: Alert[] = [
 
 export default function DashboardPage() {
   const [isLoading, setIsLoading] = useState(false);
+  const [pipelineData, setPipelineData] = useState<PipelineData | null>(null);
+  const [pressureChartData, setPressureChartData] = useState<{ node: string; pressure: number }[]>([]);
+
+  // Fetch pipeline pressure data from backend API
+  useEffect(() => {
+    const fetchPipelineData = async () => {
+      try {
+        const res = await fetch('http://127.0.0.1:8000/stream');
+        const json = await res.json();
+        
+        if (json.data && json.data.length > 0) {
+          const latest = json.data[0];
+          
+          // Transform data for chart
+          const chartData = latest.nodes.map((node: string, index: number) => ({
+            node,
+            pressure: latest.pressure[index],
+          }));
+          setPressureChartData(chartData);
+          
+          // Transform risk_nodes from array of strings to array of objects
+          // The backend returns risk_nodes as string[] (node names with low pressure)
+          const transformedRiskNodes: RiskNode[] = (latest.risk_nodes || []).map((nodeName: string) => {
+            const nodeIndex = latest.nodes.indexOf(nodeName);
+            const pressure = nodeIndex >= 0 ? latest.pressure[nodeIndex] : 0;
+            // Determine risk level based on pressure
+            const risk_level = pressure < 0.5 ? 'high' : pressure < 1.0 ? 'medium' : 'low';
+            return { node: nodeName, risk_level, pressure };
+          });
+          
+          setPipelineData({
+            nodes: latest.nodes,
+            pressure: latest.pressure,
+            risk_nodes: transformedRiskNodes,
+            timestamp: latest.timestamp,
+          });
+        }
+      } catch (error) {
+        console.log('API fetch error, using mock data:', error);
+        // Use mock data if API fails
+        const mockPipelineData: PipelineData = {
+          nodes: ['Node A', 'Node B', 'Node C', 'Node D', 'Node E', 'Node F'],
+          pressure: [3.2, 3.5, 2.8, 3.1, 2.5, 3.8],
+          risk_nodes: [
+            { node: 'Node C', risk_level: 'medium', pressure: 2.8 },
+            { node: 'Node E', risk_level: 'high', pressure: 2.5 },
+          ],
+        };
+        setPipelineData(mockPipelineData);
+        setPressureChartData(
+          mockPipelineData.nodes.map((node, index) => ({
+            node,
+            pressure: mockPipelineData.pressure[index],
+          }))
+        );
+      }
+    };
+
+    fetchPipelineData();
+    const interval = setInterval(fetchPipelineData, 5000);
+    
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     // Simulate fetching data
@@ -213,6 +290,129 @@ export default function DashboardPage() {
         <MiniMap />
         <div className="lg:col-span-2">
           <AlertFeed alerts={mockAlerts} />
+        </div>
+      </div>
+
+      {/* Pipeline Pressure Monitoring */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Pressure Stream Chart */}
+        <div className="lg:col-span-2 bg-white/80 backdrop-blur-sm rounded-2xl border border-slate-200 shadow-lg p-6">
+          <div className="flex items-center gap-3 mb-6">
+            <div className="p-2 rounded-xl bg-gradient-to-br from-blue-500 to-cyan-500 shadow-lg">
+              <Waves className="w-5 h-5 text-white" />
+            </div>
+            <div>
+              <h3 className="text-lg font-semibold text-slate-900">Pipeline Pressure Monitoring</h3>
+              <p className="text-sm text-slate-500">Real-time pressure stream data</p>
+            </div>
+          </div>
+          
+          {pressureChartData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={300}>
+              <LineChart data={pressureChartData}>
+                <defs>
+                  <linearGradient id="colorPressure" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#0ea5e9" stopOpacity={0.3} />
+                    <stop offset="95%" stopColor="#0ea5e9" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.1)" />
+                <XAxis dataKey="node" stroke="rgba(0,0,0,0.4)" fontSize={12} />
+                <YAxis stroke="rgba(0,0,0,0.4)" fontSize={12} unit=" bar" />
+                <Tooltip 
+                  contentStyle={{ 
+                    backgroundColor: 'white', 
+                    border: '1px solid rgba(0,0,0,0.1)',
+                    borderRadius: '12px',
+                    color: '#0f172a',
+                    boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)'
+                  }}
+                  formatter={(value: number) => [`${value.toFixed(2)} bar`, 'Pressure']}
+                />
+                <Line 
+                  type="monotone" 
+                  dataKey="pressure" 
+                  stroke="#0ea5e9" 
+                  strokeWidth={3}
+                  dot={{ fill: '#0ea5e9', strokeWidth: 2, r: 5 }}
+                  activeDot={{ r: 8, fill: '#0284c7' }}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-[300px] flex items-center justify-center">
+              <div className="text-center">
+                <div className="w-10 h-10 border-3 border-slate-600 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+                <p className="text-sm text-slate-500">Loading pressure data...</p>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Risk Nodes Panel */}
+        <div className="bg-white/80 backdrop-blur-sm rounded-2xl border border-slate-200 shadow-lg p-6">
+          <div className="flex items-center gap-3 mb-6">
+            <div className="p-2 rounded-xl bg-gradient-to-br from-amber-500 to-orange-500 shadow-lg">
+              <AlertTriangle className="w-5 h-5 text-white" />
+            </div>
+            <div>
+              <h3 className="text-lg font-semibold text-slate-900">Risk Nodes</h3>
+              <p className="text-sm text-slate-500">Nodes requiring attention</p>
+            </div>
+          </div>
+
+          {pipelineData?.risk_nodes && pipelineData.risk_nodes.length > 0 ? (
+            <div className="space-y-3">
+              {pipelineData.risk_nodes.map((riskNode, index) => (
+                <div 
+                  key={index}
+                  className={`p-4 rounded-xl border transition-all duration-300 ${
+                    riskNode.risk_level === 'high' 
+                      ? 'bg-red-50 border-red-200' 
+                      : riskNode.risk_level === 'medium'
+                      ? 'bg-amber-50 border-amber-200'
+                      : 'bg-blue-50 border-blue-200'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-medium text-slate-900">{riskNode.node}</span>
+                    <span className={`text-xs font-semibold px-2 py-1 rounded-full ${
+                      riskNode.risk_level === 'high'
+                        ? 'bg-red-100 text-red-700'
+                        : riskNode.risk_level === 'medium'
+                        ? 'bg-amber-100 text-amber-700'
+                        : 'bg-blue-100 text-blue-700'
+                    }`}>
+                      {riskNode.risk_level.toUpperCase()}
+                    </span>
+                  </div>
+                  <div className="text-sm text-slate-600">
+                    Pressure: <span className="font-medium text-slate-900">{riskNode.pressure} bar</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="h-48 flex items-center justify-center">
+              <div className="text-center">
+                <div className="w-12 h-12 mx-auto mb-3 rounded-full bg-emerald-100 flex items-center justify-center">
+                  <Activity className="w-6 h-6 text-emerald-600" />
+                </div>
+                <p className="text-sm text-slate-600 font-medium">All nodes operating normally</p>
+                <p className="text-xs text-slate-400 mt-1">No risk nodes detected</p>
+              </div>
+            </div>
+          )}
+
+          {/* Raw Data Preview */}
+          {pipelineData && (
+            <div className="mt-4 pt-4 border-t border-slate-200">
+              <p className="text-xs text-slate-500 mb-2">Raw Data Preview</p>
+              <pre className="text-xs bg-slate-50 rounded-lg p-3 overflow-auto max-h-32 text-slate-700">
+                {JSON.stringify(pipelineData.risk_nodes, null, 2)}
+              </pre>
+            </div>
+          )}
         </div>
       </div>
     </div>
