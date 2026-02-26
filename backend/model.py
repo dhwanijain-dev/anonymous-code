@@ -10,11 +10,8 @@ from prediction_data import build_dataset
 
 
 # ---------------- CONFIG ----------------
-# Option 1: set path directly here
-DEFAULT_DATA_ROOT = "./Net1OK"
-
-# Option 2: or use environment variable NET1_DATA_ROOT
-MODEL_OUT = "detection.pkl"
+DEFAULT_DATA_ROOT = "./BiWSData"   # BIWS scenario folder
+MODEL_OUT = "model/detection.pkl"
 # ----------------------------------------
 
 
@@ -96,6 +93,7 @@ def main() -> None:
     print("\nClassification Report:")
     print(classification_report(y_test, y_pred, digits=3))
 
+    os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
     joblib.dump(model, MODEL_OUT)
     print(f"\nDetection model saved as '{MODEL_OUT}'")
 

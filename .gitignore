@@ -1,3 +1,5 @@
 backend/temp.* 
 backend/train_data/simulation_data.csv
- backend/__pycache__/*
+backend/__pycache__/*
+backend/Net1OK/*
+backend/BiWSData/*

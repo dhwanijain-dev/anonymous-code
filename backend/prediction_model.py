@@ -13,9 +13,9 @@ from prediction_data import build_dataset
 # DEFAULT CONFIG (EDIT HERE)
 # ============================
 
-DATA_ROOT = "./Net1OK"          # Path to Net1OK root (Scenario-* folders)
-HORIZON_STEPS = 0               # 0 = current leak, >0 = future leak prediction
-MODEL_OUT = "prediction.pkl" # Output model file
+DATA_ROOT    = "./BiWSData"         # Path to BiWSData root (Scenario-* folders)
+HORIZON_STEPS = 0                   # 0 = current leak, >0 = future leak prediction
+MODEL_OUT    = "model/prediction.pkl"   # Output model file
 
 
 def main() -> None:
@@ -23,7 +23,7 @@ def main() -> None:
     # Validate paths
     # ----------------------------
     if not DATA_ROOT or not DATA_ROOT.strip():
-        raise ValueError("DATA_ROOT is empty. Please set it to the Net1OK directory.")
+        raise ValueError("DATA_ROOT is empty. Please set it to the BiWSData directory.")
 
     if not os.path.isdir(DATA_ROOT):
         raise FileNotFoundError(f"Data root directory does not exist: {DATA_ROOT}")
@@ -114,6 +114,7 @@ def main() -> None:
     # ----------------------------
     # Save model
     # ----------------------------
+    os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
     joblib.dump(model, MODEL_OUT)
     print(f"\nModel saved successfully to: {MODEL_OUT}")
 
