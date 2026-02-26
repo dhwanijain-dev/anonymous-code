@@ -5,6 +5,10 @@ import os
 import random
 import numpy as np
 import csv
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+import joblib
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -18,6 +22,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INP_FILE = os.path.join(BASE_DIR, "BIWS.inp")
 HTML_FILE = os.path.join(BASE_DIR, "../frontend/dashboard.html")
 CSV_FILE = os.path.join(BASE_DIR, "simulation_data.csv")
+MODEL_FILE = os.path.join(BASE_DIR, "model", "xgboost_leak_model.pkl")
 
 # ============================
 # APP
@@ -39,6 +44,15 @@ stream_buffer = []
 
 wn_init = wntr.network.WaterNetworkModel(INP_FILE)
 node_physical_props = {}
+pipe_physical_props = {}
+
+leak_model = None
+try:
+    leak_model = joblib.load(MODEL_FILE)
+    print(f"Loaded XGBoost model from: {MODEL_FILE}")
+except Exception as e:
+    print(f"WARNING: Failed to load leak model at {MODEL_FILE}: {e}")
+    leak_model = None
 
 for node in wn_init.junction_name_list:
     node_physical_props[node] = {
@@ -50,10 +64,108 @@ for node in wn_init.junction_name_list:
         "soil_corr_idx": random.uniform(0.1, 1.0)
     }
 
+for pipe_name in getattr(wn_init, "pipe_name_list", []):
+    try:
+        link = wn_init.get_link(pipe_name)
+        pipe_physical_props[pipe_name] = {
+            "age": random.uniform(1, 80),
+            "corrosion_idx": random.uniform(0.1, 1.0),
+            "soil_corr_idx": random.uniform(0.1, 1.0),
+            "length": float(getattr(link, "length", random.uniform(10, 2000)) or random.uniform(10, 2000)),
+            "diameter": float(getattr(link, "diameter", random.uniform(0.05, 1.0)) or random.uniform(0.05, 1.0)),
+        }
+    except Exception:
+        continue
+
 # ============================
 # SIMULATION WORKER (fixed)
 # ============================
-def extract_graph_edges(wn, results=None):
+def _safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def _binary_metrics(y_true: List[int], y_pred: List[int]) -> Dict[str, Any]:
+    if not y_true:
+        return {"n": 0}
+    tp = sum((t == 1 and p == 1) for t, p in zip(y_true, y_pred))
+    tn = sum((t == 0 and p == 0) for t, p in zip(y_true, y_pred))
+    fp = sum((t == 0 and p == 1) for t, p in zip(y_true, y_pred))
+    fn = sum((t == 1 and p == 0) for t, p in zip(y_true, y_pred))
+    n = len(y_true)
+    acc = (tp + tn) / n if n else None
+    prec = tp / (tp + fp) if (tp + fp) else None
+    rec = tp / (tp + fn) if (tp + fn) else None
+    f1 = (2 * prec * rec / (prec + rec)) if (prec is not None and rec is not None and (prec + rec)) else None
+    return {
+        "n": n,
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "accuracy": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+    }
+
+
+def _predict_nodes(
+    nodes: List[Dict[str, Any]],
+    threshold: float = 0.5,
+) -> Tuple[Dict[str, float], Dict[str, int]]:
+    """
+    Predict node leak probabilities using the trained XGBoost model.
+    Returns (prob_by_node_id, pred_by_node_id).
+    """
+    if leak_model is None:
+        return {}, {}
+
+    rows = []
+    ids = []
+    for n in nodes:
+        node_id = str(n.get("id", "")).strip()
+        if not node_id:
+            continue
+        props = node_physical_props.get(node_id)
+        if props is None:
+            # For dynamically-created nodes (e.g., pipe-split leak junctions), we skip if no props
+            continue
+        ids.append(node_id)
+        rows.append(
+            {
+                "age": props.get("age", 0.0),
+                "corrosion_idx": props.get("corrosion_idx", 0.0),
+                "length": props.get("length", 0.0),
+                # model.py trained on 'baseline_pressure' column; our props store avg_pressure
+                "baseline_pressure": props.get("avg_pressure", 0.0),
+                "press_var": props.get("press_var", 0.0),
+                "soil_corr_idx": props.get("soil_corr_idx", 0.0),
+                "current_live_pressure": n.get("pressure", 0.0),
+            }
+        )
+
+    if not rows:
+        return {}, {}
+
+    X = pd.DataFrame(rows).fillna(0.0)
+    try:
+        proba = leak_model.predict_proba(X)[:, 1]
+    except Exception:
+        # Some models may not support predict_proba; fall back to predict
+        preds = leak_model.predict(X)
+        prob_by_id = {i: float(p) for i, p in zip(ids, preds)}
+        pred_by_id = {i: int(p >= threshold) for i, p in zip(ids, preds)}
+        return prob_by_id, pred_by_id
+
+    prob_by_id = {i: float(p) for i, p in zip(ids, proba)}
+    pred_by_id = {i: int(p >= threshold) for i, p in zip(ids, proba)}
+    return prob_by_id, pred_by_id
+
+
+def extract_graph_edges(wn, results=None, active_pipe_leaks: Optional[set] = None):
     """
     Extract pipe/pump/valve connections from WNTR
     """
@@ -81,6 +193,7 @@ def extract_graph_edges(wn, results=None):
                 except Exception:
                     edge["flowrate"] = None
 
+            edge["is_leaking"] = int(active_pipe_leaks is not None and key in active_pipe_leaks)
             edges.append(edge)
         except Exception:
             continue
@@ -107,6 +220,8 @@ def simulation_worker():
 
             # Track which nodes get a leak during this cycle
             active_leaks = set()
+            # Track which pipes get a leak during this cycle
+            active_pipe_leaks = set()
 
             # 2. Risk-based Leakage Event (may set emitter_coefficient)
             for node in wn.junction_name_list:
@@ -149,6 +264,64 @@ def simulation_worker():
                     except Exception as ex:
                         print(f"Failed to set emitter for node {node}: {ex}")
 
+            # 2b. Risk-based pipe leak events (split pipe + add leak junction)
+            # Note: We'll label the affected pipe segments as leaking for evaluation.
+            for pipe_name in getattr(wn, "pipe_name_list", []):
+                props = pipe_physical_props.get(pipe_name)
+                if props is None:
+                    continue
+
+                normalized_risk_score = (
+                    (props["age"] / 80.0) * 0.25 +
+                    (props["corrosion_idx"]) * 0.25 +
+                    (min(props["length"], 2000.0) / 2000.0) * 0.25 +
+                    (props["soil_corr_idx"]) * 0.25
+                )
+                pipe_leak_threshold = normalized_risk_score * 0.0005
+
+                if np.random.random() < pipe_leak_threshold:
+                    suffix = f"{int(time.time() * 1000)}_{random.randint(0, 10**9)}"
+                    new_junc = f"LEAK_{pipe_name}_{suffix}"
+                    new_pipe = f"{pipe_name}_SPLIT_{suffix}"
+                    try:
+                        # Insert a junction mid-pipe and keep original pipe name for one segment.
+                        wntr.morph.split_pipe(
+                            wn,
+                            pipe_name_to_split=pipe_name,
+                            new_pipe_name=new_pipe,
+                            new_junction_name=new_junc,
+                            split_at_point=0.5,
+                            return_copy=False,
+                        )
+
+                        # Add WNTR leak on the newly created junction
+                        leak_junc_obj = wn.get_node(new_junc)
+                        leak_junc_obj.add_leak(
+                            wn,
+                            area=random.uniform(0.0005, 0.003),
+                            discharge_coeff=0.75,
+                            start_time=0,
+                            end_time=3600,
+                        )
+
+                        # Ensure we can run the node model for this junction as well
+                        if new_junc not in node_physical_props:
+                            node_physical_props[new_junc] = {
+                                "age": props["age"],
+                                "corrosion_idx": props["corrosion_idx"],
+                                "length": 1.0,
+                                "avg_pressure": random.uniform(20, 100),
+                                "press_var": random.uniform(0.5, 10.0),
+                                "soil_corr_idx": props["soil_corr_idx"],
+                            }
+
+                        active_leaks.add(str(new_junc).strip())
+                        active_pipe_leaks.add(str(pipe_name).strip())
+                        active_pipe_leaks.add(str(new_pipe).strip())
+                    except Exception:
+                        # Pipe splitting/leak insertion can fail for some networks; ignore safely.
+                        continue
+
             # Run simulation
             sim = wntr.sim.WNTRSimulator(wn)
             results = sim.run_sim()
@@ -186,11 +359,45 @@ def simulation_worker():
                 })
 
             # Extract edges (pipes / pumps / valves)
-            graph_edges = extract_graph_edges(wn, results)
+            graph_edges = extract_graph_edges(wn, results, active_pipe_leaks=active_pipe_leaks)
+
+            # Model predictions (nodes)
+            prob_by_node, pred_by_node = _predict_nodes(graph_nodes, threshold=0.5)
+            for n in graph_nodes:
+                nid = str(n.get("id", "")).strip()
+                if nid in prob_by_node:
+                    n["pred_leak_prob"] = prob_by_node[nid]
+                    n["pred_is_leaking"] = pred_by_node[nid]
+                else:
+                    n["pred_leak_prob"] = None
+                    n["pred_is_leaking"] = None
+
+            # Model predictions (pipes): approximate from endpoint node probabilities
+            node_prob_map = {str(n["id"]).strip(): n.get("pred_leak_prob") for n in graph_nodes}
+            for e in graph_edges:
+                u = str(e.get("from", "")).strip()
+                v = str(e.get("to", "")).strip()
+                pu = node_prob_map.get(u)
+                pv = node_prob_map.get(v)
+                probs = [p for p in [pu, pv] if isinstance(p, (int, float))]
+                p_pipe = max(probs) if probs else None
+                e["pred_leak_prob"] = _safe_float(p_pipe)
+                e["pred_is_leaking"] = int(p_pipe >= 0.5) if isinstance(p_pipe, (int, float)) else None
+
+            # Metrics vs actual leak flags from this simulation cycle
+            node_y_true = [int(n.get("is_leaking", 0)) for n in graph_nodes if n.get("pred_is_leaking") is not None]
+            node_y_pred = [int(n.get("pred_is_leaking", 0)) for n in graph_nodes if n.get("pred_is_leaking") is not None]
+            pipe_y_true = [int(e.get("is_leaking", 0)) for e in graph_edges if e.get("pred_is_leaking") is not None]
+            pipe_y_pred = [int(e.get("pred_is_leaking", 0)) for e in graph_edges if e.get("pred_is_leaking") is not None]
 
             snapshot = {
                 "nodes": graph_nodes,
                 "edges": graph_edges,
+                "metrics": {
+                    "nodes": _binary_metrics(node_y_true, node_y_pred),
+                    "pipes": _binary_metrics(pipe_y_true, pipe_y_pred),
+                    "model_loaded": bool(leak_model is not None),
+                },
                 "timestamp": current_time
             }
             print(graph_nodes[0])
