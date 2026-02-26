@@ -1,230 +1,128 @@
-import pandas as pd
+    
+import argparse
+import os
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
-import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score
+import joblib
+import xgboost as xgb
 
-# -----------------------------
-# 1. Load and inspect data
-# -----------------------------
-df = pd.read_csv("leak_dataset_timestep.csv", index_col=0)  # adjust path
-print("Data shape:", df.shape)
-print("Columns:", df.columns.tolist())
+def topk_accuracy(probs, true_labels, k=3):
+    # probs: (n_samples, n_classes) predicted probabilities
+    # true_labels: (n_samples,) ints
+    topk_preds = np.argsort(probs, axis=1)[:, ::-1][:, :k]  # top-k indices
+    correct = 0
+    for i in range(len(true_labels)):
+        if true_labels[i] in topk_preds[i]:
+            correct += 1
+    return correct / len(true_labels)
 
-# Identify pressure columns (all except metadata)
-metadata_cols = ['scenario_id', 'label', 'leak_pipe', 'leak_node', 'leak_area']
-pressure_cols = [col for col in df.columns if col not in metadata_cols]
+parser = argparse.ArgumentParser()
+parser.add_argument("--dataset", default="gnn_rf_dataset.npz")
+parser.add_argument("--out_dir", default="models")
+parser.add_argument("--test_size", type=float, default=0.1)
+parser.add_argument("--val_size", type=float, default=0.1)
+parser.add_argument("--random_state", type=int, default=42)
+parser.add_argument("--rf_n_estimators", type=int, default=200)
+parser.add_argument("--xgb_rounds", type=int, default=200)
+parser.add_argument("--xgb_lr", type=float, default=0.1)
+args = parser.parse_args()
 
-# -----------------------------
-# 2. Group by scenario_id and sort by time
-# -----------------------------
-sequences = []
-labels = []
-scenario_ids = []
+os.makedirs(args.out_dir, exist_ok=True)
 
-for sid, group in df.groupby('scenario_id'):
-    group = group.sort_index()                     # ensure time order (index = time)
-    X = group[pressure_cols].values.astype(np.float32)
-    y = group['label'].values.astype(np.float32)
-    sequences.append(X)
-    labels.append(y)
-    scenario_ids.append(sid)
+# Load dataset
+arr = np.load(args.dataset, allow_pickle=True)
+X = arr["X"]   # shape (N, D)
+y = arr["y"]   # shape (N,)
+node_names = arr["node_names"]
+edge_names = arr["edge_names"]
 
-print(f"Number of scenarios: {len(sequences)}")
-print(f"Sequence shape (first): {sequences[0].shape}")
+print("Loaded dataset:", X.shape, y.shape)
+num_samples, feat_dim = X.shape
+num_classes = int(np.max(y) + 1)
+print("Num classes (pipes):", num_classes)
 
-# -----------------------------
-# 3. Pad sequences to same length
-#    (using numpy, later we'll mask padded steps)
-# -----------------------------
-from tensorflow.keras.preprocessing.sequence import pad_sequences  # optional, you can also use torch.nn.utils.rnn.pad_sequence
+# Split: train / temp
+idx_train, idx_temp, y_train, y_temp = train_test_split(np.arange(num_samples), y, test_size=(args.val_size + args.test_size), stratify=y, random_state=args.random_state)
+# Split temp -> val / test
+val_ratio = args.val_size / (args.val_size + args.test_size)
+idx_val, idx_test, _, _ = train_test_split(idx_temp, y_temp, test_size=(1 - val_ratio), stratify=y_temp, random_state=args.random_state)
 
-# Convert to list of tensors for easier handling later
-sequences_torch = [torch.tensor(seq) for seq in sequences]
-labels_torch = [torch.tensor(lab) for lab in labels]
+X_train, X_val, X_test = X[idx_train], X[idx_val], X[idx_test]
+y_train, y_val, y_test = y[idx_train], y[idx_val], y[idx_test]
 
-# Pad sequences
-X_padded = nn.utils.rnn.pad_sequence(sequences_torch, batch_first=True, padding_value=0.0)
-y_padded = nn.utils.rnn.pad_sequence(labels_torch, batch_first=True, padding_value=-1.0)  # -1 will be ignored
+print("Splits: train", X_train.shape[0], "val", X_val.shape[0], "test", X_test.shape[0])
 
-print("Padded shape:", X_padded.shape)  # (n_scenarios, max_timesteps, n_features)
+# Standardize? For tree models not necessary; but we center residuals optionally
+# We'll scale features column-wise to zero mean for slight numeric stability
+mean = X_train.mean(axis=0, keepdims=True)
+std = X_train.std(axis=0, keepdims=True) + 1e-9
+X_train_s = (X_train - mean) / std
+X_val_s = (X_val - mean) / std
+X_test_s = (X_test - mean) / std
 
-# -----------------------------
-# 4. Train / validation / test split (by scenario)
-# -----------------------------
-n_scenarios = X_padded.shape[0]
-indices = np.arange(n_scenarios)
-train_idx, test_idx = train_test_split(indices, test_size=0.2, random_state=42)
-train_idx, val_idx = train_test_split(train_idx, test_size=0.25, random_state=42)  # 0.25*0.8 = 0.2
+# -------------------------
+# RandomForest
+# -------------------------
+print("Training RandomForest...")
+rf = RandomForestClassifier(n_estimators=args.rf_n_estimators, n_jobs=-1, class_weight=None, random_state=args.random_state)
+rf.fit(X_train_s, y_train)
 
-X_train, y_train = X_padded[train_idx], y_padded[train_idx]
-X_val, y_val = X_padded[val_idx], y_padded[val_idx]
-X_test, y_test = X_padded[test_idx], y_padded[test_idx]
+probs_val_rf = rf.predict_proba(X_val_s)
+val_top1_rf = accuracy_score(y_val, np.argmax(probs_val_rf, axis=1))
+val_top3_rf = topk_accuracy(probs_val_rf, y_val, k=3)
+print(f"RandomForest val Top-1: {val_top1_rf:.4f}, Top-3: {val_top3_rf:.4f}")
 
-print(f"Train scenarios: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
+# Save RF
+rf_path = os.path.join(args.out_dir, "rf_best.joblib")
+joblib.dump({"model": rf, "mean": mean, "std": std, "node_names": node_names, "edge_names": edge_names}, rf_path)
+print("Saved RandomForest to", rf_path)
 
-# -----------------------------
-# 5. Feature scaling (fit on training data only)
-# -----------------------------
-n_timesteps, n_features = X_train.shape[1], X_train.shape[2]
-X_train_flat = X_train.reshape(-1, n_features).numpy()
-scaler = StandardScaler().fit(X_train_flat)
+# -------------------------
+# XGBoost
+# -------------------------
+print("Training XGBoost...")
+# xgboost expects DMatrix
+dtrain = xgb.DMatrix(X_train_s, label=y_train)
+dval = xgb.DMatrix(X_val_s, label=y_val)
+param = {
+    "objective": "multi:softprob",
+    "num_class": num_classes,
+    "eval_metric": "mlogloss",
+    "eta": args.xgb_lr,
+    "max_depth": 6,
+    "verbosity": 1
+}
+evallist = [(dtrain, "train"), (dval, "val")]
+bst = xgb.train(param, dtrain, num_boost_round=args.xgb_rounds, evals=evallist, early_stopping_rounds=20, verbose_eval=10)
 
-def scale_tensor(X):
-    orig_shape = X.shape
-    X_flat = X.reshape(-1, n_features).numpy()
-    X_scaled = scaler.transform(X_flat)
-    return torch.tensor(X_scaled.reshape(orig_shape), dtype=torch.float32)
+# Evaluate
+probs_val_xgb = bst.predict(dval)  # shape (n_val, num_classes)
+val_top1_xgb = accuracy_score(y_val, np.argmax(probs_val_xgb, axis=1))
+val_top3_xgb = topk_accuracy(probs_val_xgb, y_val, k=3)
+print(f"XGBoost val Top-1: {val_top1_xgb:.4f}, Top-3: {val_top3_xgb:.4f}")
 
-X_train = scale_tensor(X_train)
-X_val   = scale_tensor(X_val)
-X_test  = scale_tensor(X_test)
+# Save XGBoost model
+xgb_path = os.path.join(args.out_dir, "xgb_best.json")
+bst.save_model(xgb_path)
+# save scaler and names
+joblib.dump({"mean": mean, "std": std, "node_names": node_names, "edge_names": edge_names}, os.path.join(args.out_dir, "xgb_meta.joblib"))
+print("Saved XGBoost to", xgb_path)
 
-# -----------------------------
-# 6. Create PyTorch Dataset and DataLoader
-# -----------------------------
-class LeakDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = X
-        self.y = y
+# Final test evaluation with the better model (choose by val Top-1)
+if val_top1_xgb >= val_top1_rf:
+    print("XGBoost selected as best (val Top-1). Evaluating on test set...")
+    dtest = xgb.DMatrix(X_test_s)
+    probs_test = bst.predict(dtest)
+    test_top1 = accuracy_score(y_test, np.argmax(probs_test, axis=1))
+    test_top3 = topk_accuracy(probs_test, y_test, k=3)
+    print(f"XGBoost test Top-1: {test_top1:.4f}, Top-3: {test_top3:.4f}")
+else:
+    print("RandomForest selected as best (val Top-1). Evaluating on test set...")
+    probs_test_rf = rf.predict_proba(X_test_s)
+    test_top1 = accuracy_score(y_test, np.argmax(probs_test_rf, axis=1))
+    test_top3 = topk_accuracy(probs_test_rf, y_test, k=3)
+    print(f"RF test Top-1: {test_top1:.4f}, Top-3: {test_top3:.4f}")
 
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-train_dataset = LeakDataset(X_train, y_train)
-val_dataset   = LeakDataset(X_val, y_val)
-test_dataset  = LeakDataset(X_test, y_test)
-
-batch_size = 16
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-# -----------------------------
-# 7. Define LSTM Model
-# -----------------------------
-class LSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers, dropout=0.2):
-        super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers,
-                            batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_dim, 1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        # x shape: (batch, seq_len, input_dim)
-        lstm_out, _ = self.lstm(x)          # (batch, seq_len, hidden_dim)
-        out = self.fc(lstm_out)              # (batch, seq_len, 1)
-        out = self.sigmoid(out).squeeze(-1)  # (batch, seq_len)
-        return out
-
-# Hyperparameters
-input_dim = n_features
-hidden_dim = 64
-num_layers = 2
-dropout = 0.2
-
-model = LSTMModel(input_dim, hidden_dim, num_layers, dropout)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model.to(device)
-
-criterion = nn.BCELoss(reduction='none')  # we will mask padded steps
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-# -----------------------------
-# 8. Training Loop with Masking
-# -----------------------------
-def train_one_epoch(model, loader, optimizer, criterion, device):
-    model.train()
-    total_loss = 0
-    for X_batch, y_batch in loader:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-
-        optimizer.zero_grad()
-        outputs = model(X_batch)                     # (batch, seq_len)
-
-        # Create mask: positions where y_batch != -1 are valid
-        mask = (y_batch != -1).float()
-        loss = criterion(outputs, y_batch)           # (batch, seq_len)
-        loss = (loss * mask).sum() / mask.sum()      # average over valid timesteps
-
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(loader)
-
-def evaluate(model, loader, criterion, device):
-    model.eval()
-    total_loss = 0
-    with torch.no_grad():
-        for X_batch, y_batch in loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            outputs = model(X_batch)
-            mask = (y_batch != -1).float()
-            loss = criterion(outputs, y_batch)
-            loss = (loss * mask).sum() / mask.sum()
-            total_loss += loss.item()
-    return total_loss / len(loader)
-
-epochs = 60
-train_losses, val_losses = [], []
-
-for epoch in range(epochs):
-    train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
-    val_loss = evaluate(model, val_loader, criterion, device)
-    train_losses.append(train_loss)
-    val_losses.append(val_loss)
-    print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-
-# -----------------------------
-# 9. Evaluation on Test Set
-# -----------------------------
-model.eval()
-all_preds = []
-all_labels = []
-with torch.no_grad():
-    for X_batch, y_batch in test_loader:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        outputs = model(X_batch)                         # (batch, seq_len)
-        preds = (outputs > 0.5).float()
-        # Flatten and collect only valid timesteps
-        mask = (y_batch != -1)
-        all_preds.append(preds[mask].cpu().numpy())
-        all_labels.append(y_batch[mask].cpu().numpy())
-
-all_preds = np.concatenate(all_preds)
-all_labels = np.concatenate(all_labels)
-
-torch.save(model.state_dict(),"model.pth")
-
-print("\nClassification Report:")
-print(all_labels,all_preds)
-print(classification_report(all_labels, all_preds, target_names=['No leak', 'Leak']))
-print("Confusion Matrix:\n", confusion_matrix(all_labels, all_preds))
-
-# -----------------------------
-# 10. Plot Training History
-# -----------------------------
-plt.figure(figsize=(10,4))
-plt.subplot(1,2,1)
-plt.plot(train_losses, label='Train')
-plt.plot(val_losses, label='Validation')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend()
-plt.title('Loss over epochs')
-
-plt.subplot(1,2,2)
-# Accuracy over epochs (optional) – you can compute per epoch if desired
-# Here we just show loss
-plt.title('Training complete')
-plt.tight_layout()
-plt.show()
+print("Done.")
