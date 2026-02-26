@@ -30,14 +30,6 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # DATASET INITIALIZATION
 # ============================
 
-if not os.path.exists(CSV_FILE):
-    with open(CSV_FILE, mode='w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow([
-            "timestamp", "node_id", "age", "corrosion_idx",
-            "length", "baseline_pressure", "press_var",
-            "soil_corr_idx", "current_live_pressure", "is_leaking"
-        ])
 
 # ============================
 # STREAM BUFFER & STATIC PROPS
