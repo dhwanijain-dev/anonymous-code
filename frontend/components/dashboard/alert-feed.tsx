@@ -60,7 +60,7 @@ export function AlertFeed({ alerts }: AlertFeedProps) {
             <div
               key={alert.id}
               className={cn(
-                'p-4 rounded-xl bg-gradient-to-r border transition-all duration-300 hover:scale-[1.01] cursor-pointer group shadow-sm',
+                'p-4 rounded-xl bg-linear-to-r border transition-all duration-300 hover:scale-[1.01] cursor-pointer group shadow-sm',
                 styles.bg,
                 styles.border
               )}

@@ -7,6 +7,7 @@ import { DashboardMetrics, Alert } from '@/lib/types';
 import { KPICard } from '@/components/dashboard/kpi-card';
 import { AlertFeed } from '@/components/dashboard/alert-feed';
 import { MiniMap } from '@/components/dashboard/mini-map';
+import { PressureHeatmap } from '@/components/dashboard/pressure-heatmap';
 
 // Types for pipeline data
 interface RiskNode {
@@ -199,6 +200,16 @@ export default function DashboardPage() {
         />
       </div>
 
+      {/* Pressure Heatmap - Full viewport height */}
+      <PressureHeatmap 
+        data={pipelineData ? {
+          nodes: pipelineData.nodes,
+          pressure: pipelineData.pressure,
+          riskNodes: pipelineData.risk_nodes.map(r => r.node)
+        } : null}
+        isLoading={!pipelineData}
+      />
+
       {/* Charts and Alerts */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Water Loss Trend */}
@@ -350,7 +361,7 @@ export default function DashboardPage() {
         </div>
 
         {/* Risk Nodes Panel */}
-        <div className="bg-white/80 backdrop-blur-sm rounded-2xl border border-slate-200 shadow-lg p-6">
+        <div className="bg-white/80 backdrop-blur-sm rounded-2xl border h-120 overflow-y-scroll border-slate-200 shadow-lg p-6">
           <div className="flex items-center gap-3 mb-6">
             <div className="p-2 rounded-xl bg-gradient-to-br from-amber-500 to-orange-500 shadow-lg">
               <AlertTriangle className="w-5 h-5 text-white" />

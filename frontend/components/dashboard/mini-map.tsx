@@ -19,6 +19,7 @@ interface LeafletMapProps {
 
 // Dynamically import map component to avoid SSR issues with Leaflet
 const LeafletMap = dynamic<LeafletMapProps>(
+  //@ts-ignore
   () => import('./leaflet-map') as Promise<{ default: ComponentType<LeafletMapProps> }>, 
   { 
     ssr: false,
