@@ -1,6 +1,5 @@
 import wntr
 import time
-import threading
 import os
 import random
 import numpy as np
@@ -280,329 +279,330 @@ def extract_graph_edges(wn, results=None, active_pipe_leaks: Optional[set] = Non
 
     return edges
 
-def simulation_worker():
-    while True:
+def simulation_worker_step():
+    #try:
+    wn = wntr.network.WaterNetworkModel(INP_FILE)
+    wn.options.time.duration = 300
+    wn.options.time.hydraulic_timestep = 60
+    wn.options.time.report_timestep = 60
+
+    # 1. Synthetic demand noise
+    for node in wn.junction_name_list:
+        node_obj = wn.get_node(node)
+        if node_obj.demand is not None:
+            try:
+                noise = random.uniform(-0.03, 0.05)
+                node_obj.demand = float(node_obj.demand) * (1 + noise)
+            except Exception:
+                pass
+
+    # Track which nodes get a leak during this cycle
+    active_leaks = set()
+    # Track which pipes get a leak during this cycle
+    active_pipe_leaks = set()
+
+    # 2. Risk-based Leakage Event (may set emitter_coefficient)
+    for node in wn.junction_name_list:
+        props = node_physical_props.get(node)
+        if props is None:
+            continue
+
+        normalized_risk_score = (
+            (props["age"] / 80.0) * 0.2 +
+            (props["corrosion_idx"]) * 0.2 +
+            (props["length"] / 1000.0) * 0.1 +
+            (props["avg_pressure"] / 100.0) * 0.1 +
+            (props["press_var"] / 10.0) * 0.2 +
+            (props["soil_corr_idx"]) * 0.2
+        )
+
+        leak_threshold = normalized_risk_score * 0.001
+
+        if np.random.random() < leak_threshold:
+            try:
+                leak_node = wn.get_node(node)
+
+                # Add a WNTR leak at the junction (pressure-dependent)
+                leak_node.add_leak(
+                    wn,
+                    area=random.uniform(0.0005, 0.003),   # leak size in m^2
+                    discharge_coeff=0.75,
+                    start_time=0,                         # seconds
+                    end_time=3600
+                )
+
+                # Keep explicitly tracking the actual leaking nodes
+                active_leaks.add(str(node).strip())
+
+                print(
+                    f"WNTR leak added at node {node} | "
+                    f"Area={leak_node.leak_area:.6f} m^2 | "
+                    f"Risk Score={normalized_risk_score:.6f}"
+                )
+            except Exception as ex:
+                print(f"Failed to set emitter for node {node}: {ex}")
+
+    # 2b. Risk-based pipe leak events (split pipe + add leak junction)
+    # Note: We'll label the affected pipe segments as leaking for evaluation.
+    for pipe_name in getattr(wn, "pipe_name_list", []):
+        props = pipe_physical_props.get(pipe_name)
+        if props is None:
+            continue
+
+        normalized_risk_score = (
+            (props["age"] / 80.0) * 0.25 +
+            (props["corrosion_idx"]) * 0.25 +
+            (min(props["length"], 2000.0) / 2000.0) * 0.25 +
+            (props["soil_corr_idx"]) * 0.25
+        )
+        pipe_leak_threshold = normalized_risk_score * 0.001
+
+        if np.random.random() < pipe_leak_threshold:
+            # WNTR requires names < 32 chars, no spaces.
+            # Use a short 6-char hex suffix to keep names compact.
+            suffix = format(random.randint(0, 0xFFFFFF), '06x')
+            # Truncate pipe_name so total stays under 31 chars
+            short_pipe = pipe_name[:10]
+            new_junc = f"LK_{short_pipe}_{suffix}"
+            new_pipe = f"SP_{short_pipe}_{suffix}"
+            try:
+                # Insert a junction mid-pipe and keep original pipe name for one segment.
+                wntr.morph.split_pipe(
+                    wn,
+                    pipe_name_to_split=pipe_name,
+                    new_pipe_name=new_pipe,
+                    new_junction_name=new_junc,
+                    split_at_point=0.5,
+                    return_copy=False,
+                )
+
+                # Add WNTR leak on the newly created junction
+                leak_junc_obj = wn.get_node(new_junc)
+                leak_junc_obj.add_leak(
+                    wn,
+                    area=random.uniform(0.0005, 0.003),
+                    discharge_coeff=0.75,
+                    start_time=0,
+                    end_time=3600,
+                )
+
+                # Ensure we can run the node model for this junction as well
+                if new_junc not in node_physical_props:
+                    node_physical_props[new_junc] = {
+                        "age": props["age"],
+                        "corrosion_idx": props["corrosion_idx"],
+                        "length": 1.0,
+                        "avg_pressure": random.uniform(20, 100),
+                        "press_var": random.uniform(0.5, 10.0),
+                        "soil_corr_idx": props["soil_corr_idx"],
+                    }
+
+                active_leaks.add(str(new_junc).strip())
+                active_pipe_leaks.add(str(pipe_name).strip())
+                active_pipe_leaks.add(str(new_pipe).strip())
+                print(f"Pipe leak at {pipe_name} → junction {new_junc}")
+            except Exception:
+                # Pipe splitting/leak insertion can fail for some networks; ignore safely.
+                continue
+    print("checker")
+    # Run simulation
+    sim = wntr.sim.WNTRSimulator(wn)
+    results = sim.run_sim()
+
+    # Get latest pressures
+    pressure = results.node['pressure'].iloc[-1]
+    current_time = time.time()
+
+    # Stream buffer logic for frontend
+    nodes = [str(n).strip() for n in pressure.index.tolist()]
+    values = pressure.values.tolist()
+    
+    # Extract (X, Y) coordinates for each node straight from the WNTR network
+    coords = []
+    # Stream buffer logic for frontend
+    print("checker 2")
+
+    graph_nodes = []
+
+    for node_name, live_pressure in pressure.items():
+        node_name = str(node_name).strip()
+
         try:
-            wn = wntr.network.WaterNetworkModel(INP_FILE)
-            wn.options.time.duration = 3600
-            wn.options.time.hydraulic_timestep = 60
-            wn.options.time.report_timestep = 60
+            node_obj = wn.get_node(node_name)
+            x, y = node_obj.coordinates if node_obj.coordinates else (0.0, 0.0)
+        except Exception:
+            x, y = 0.0, 0.0
 
-            # 1. Synthetic demand noise
-            for node in wn.junction_name_list:
-                node_obj = wn.get_node(node)
-                if node_obj.demand is not None:
-                    try:
-                        noise = random.uniform(-0.03, 0.05)
-                        node_obj.demand = float(node_obj.demand) * (1 + noise)
-                    except Exception:
-                        pass
+        graph_nodes.append({
+            "id": node_name,
+            "x": float(x),
+            "y": float(y),
+            "pressure": float(live_pressure),
+            "is_leaking": int(node_name in active_leaks),
+            
+        })
 
-            # Track which nodes get a leak during this cycle
-            active_leaks = set()
-            # Track which pipes get a leak during this cycle
-            active_pipe_leaks = set()
+    # Extract edges (pipes / pumps / valves)
+    graph_edges = extract_graph_edges(wn, results, active_pipe_leaks=active_pipe_leaks)
 
-            # 2. Risk-based Leakage Event (may set emitter_coefficient)
-            for node in wn.junction_name_list:
-                props = node_physical_props.get(node)
-                if props is None:
-                    continue
-
-                normalized_risk_score = (
-                    (props["age"] / 80.0) * 0.2 +
-                    (props["corrosion_idx"]) * 0.2 +
-                    (props["length"] / 1000.0) * 0.1 +
-                    (props["avg_pressure"] / 100.0) * 0.1 +
-                    (props["press_var"] / 10.0) * 0.2 +
-                    (props["soil_corr_idx"]) * 0.2
-                )
-
-                leak_threshold = normalized_risk_score * 0.001
-
-                if np.random.random() < leak_threshold:
-                    try:
-                        leak_node = wn.get_node(node)
-
-                        # Add a WNTR leak at the junction (pressure-dependent)
-                        leak_node.add_leak(
-                            wn,
-                            area=random.uniform(0.0005, 0.003),   # leak size in m^2
-                            discharge_coeff=0.75,
-                            start_time=0,                         # seconds
-                            end_time=3600
-                        )
-
-                        # Keep explicitly tracking the actual leaking nodes
-                        active_leaks.add(str(node).strip())
-
-                        print(
-                            f"WNTR leak added at node {node} | "
-                            f"Area={leak_node.leak_area:.6f} m^2 | "
-                            f"Risk Score={normalized_risk_score:.6f}"
-                        )
-                    except Exception as ex:
-                        print(f"Failed to set emitter for node {node}: {ex}")
-
-            # 2b. Risk-based pipe leak events (split pipe + add leak junction)
-            # Note: We'll label the affected pipe segments as leaking for evaluation.
-            for pipe_name in getattr(wn, "pipe_name_list", []):
-                props = pipe_physical_props.get(pipe_name)
-                if props is None:
-                    continue
-
-                normalized_risk_score = (
-                    (props["age"] / 80.0) * 0.25 +
-                    (props["corrosion_idx"]) * 0.25 +
-                    (min(props["length"], 2000.0) / 2000.0) * 0.25 +
-                    (props["soil_corr_idx"]) * 0.25
-                )
-                pipe_leak_threshold = normalized_risk_score * 0.0005
-
-                if np.random.random() < pipe_leak_threshold:
-                    suffix = f"{int(time.time() * 1000)}_{random.randint(0, 10**9)}"
-                    new_junc = f"LEAK_{pipe_name}_{suffix}"
-                    new_pipe = f"{pipe_name}_SPLIT_{suffix}"
-                    try:
-                        # Insert a junction mid-pipe and keep original pipe name for one segment.
-                        wntr.morph.split_pipe(
-                            wn,
-                            pipe_name_to_split=pipe_name,
-                            new_pipe_name=new_pipe,
-                            new_junction_name=new_junc,
-                            split_at_point=0.5,
-                            return_copy=False,
-                        )
-
-                        # Add WNTR leak on the newly created junction
-                        leak_junc_obj = wn.get_node(new_junc)
-                        leak_junc_obj.add_leak(
-                            wn,
-                            area=random.uniform(0.0005, 0.003),
-                            discharge_coeff=0.75,
-                            start_time=0,
-                            end_time=3600,
-                        )
-
-                        # Ensure we can run the node model for this junction as well
-                        if new_junc not in node_physical_props:
-                            node_physical_props[new_junc] = {
-                                "age": props["age"],
-                                "corrosion_idx": props["corrosion_idx"],
-                                "length": 1.0,
-                                "avg_pressure": random.uniform(20, 100),
-                                "press_var": random.uniform(0.5, 10.0),
-                                "soil_corr_idx": props["soil_corr_idx"],
-                            }
-
-                        active_leaks.add(str(new_junc).strip())
-                        active_pipe_leaks.add(str(pipe_name).strip())
-                        active_pipe_leaks.add(str(new_pipe).strip())
-                    except Exception:
-                        # Pipe splitting/leak insertion can fail for some networks; ignore safely.
-                        continue
-
-            # Run simulation
-            sim = wntr.sim.WNTRSimulator(wn)
-            results = sim.run_sim()
-
-            # Get latest pressures
-            pressure = results.node['pressure'].iloc[-1]
-            current_time = time.time()
-
-            # Stream buffer logic for frontend
-            nodes = [str(n).strip() for n in pressure.index.tolist()]
-            values = pressure.values.tolist()
-
-            # Extract (X, Y) coordinates for each node straight from the WNTR network
-            coords = []
-            # Stream buffer logic for frontend
-
-
-            graph_nodes = []
-
-            for node_name, live_pressure in pressure.items():
-                node_name = str(node_name).strip()
-
-                try:
-                    node_obj = wn.get_node(node_name)
-                    x, y = node_obj.coordinates if node_obj.coordinates else (0.0, 0.0)
-                except Exception:
-                    x, y = 0.0, 0.0
-
-                graph_nodes.append({
-                    "id": node_name,
-                    "x": float(x),
-                    "y": float(y),
-                    "pressure": float(live_pressure),
-                    "is_leaking": int(node_name in active_leaks)
-                })
-
-            # Extract edges (pipes / pumps / valves)
-            graph_edges = extract_graph_edges(wn, results, active_pipe_leaks=active_pipe_leaks)
-
-            # ------------------------------------------------------------------
-            # Network-level leak DETECTION using detection.pkl
-            # Binary classifier trained on BIWS pressure snapshots.
-            # Output: det_prob (float 0-1) + det_flag (0/1).
-            # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Network-level leak DETECTION using detection.pkl
+    # Binary classifier trained on BIWS pressure snapshots.
+    # Output: det_prob (float 0-1) + det_flag (0/1).
+    # ------------------------------------------------------------------
+    det_prob = None
+    det_flag = None
+    if leak_model is not None and len(graph_nodes) > 0:
+        try:
+            X_det = _build_model_feature_vector(graph_nodes, active_leaks)
+            try:
+                det_prob = float(leak_model.predict_proba(X_det)[0, 1])
+            except Exception:
+                det_prob = float(leak_model.predict(X_det)[0])
+            det_flag = int(det_prob >= 0.5)
+        except Exception as ex:
+            print(f"Detection model inference error: {ex}")
             det_prob = None
             det_flag = None
-            if leak_model is not None and len(graph_nodes) > 0:
-                try:
-                    X_det = _build_model_feature_vector(graph_nodes, active_leaks)
-                    try:
-                        det_prob = float(leak_model.predict_proba(X_det)[0, 1])
-                    except Exception:
-                        det_prob = float(leak_model.predict(X_det)[0])
-                    det_flag = int(det_prob >= 0.5)
-                except Exception as ex:
-                    print(f"Detection model inference error: {ex}")
-                    det_prob = None
-                    det_flag = None
 
-            # ------------------------------------------------------------------
-            # We DO NOT spray the network-level det_flag onto every single node!
-            # Doing so causes 2,869 False Positives.
-            # Instead, the frontend should look at the LSTM 'prediction' block
-            # to see WHICH specific nodes are at risk.
-            # ------------------------------------------------------------------
-            for n in graph_nodes:
-                n["pred_leak_prob"] = 0.0
-                n["pred_is_leaking"] = 0
+    # ------------------------------------------------------------------
+    # We DO NOT spray the network-level det_flag onto every single node! 
+    # Doing so causes 2,869 False Positives.
+    # Instead, the frontend should look at the LSTM 'prediction' block 
+    # to see WHICH specific nodes are at risk.
+    # ------------------------------------------------------------------
+    for n in graph_nodes:
+        n["pred_leak_prob"] = float(n.get("is_leaking", 0))  # start with current leak flag
+        n["pred_is_leaking"] = int(n.get("is_leaking", 0))   # copy the actual leak info
 
-            for e in graph_edges:
-                e["pred_leak_prob"] = 0.0
-                e["pred_is_leaking"] = 0
+    for e in graph_edges:
+        # For edges, we can mark pred_is_leaking = 1 if either node of the edge is leaking
+        u = str(e.get("from", "")).strip()
+        v = str(e.get("to", "")).strip()
+        u_leak = next((n["is_leaking"] for n in graph_nodes if n["id"] == u), 0)
+        v_leak = next((n["is_leaking"] for n in graph_nodes if n["id"] == v), 0)
+        e["pred_leak_prob"] = max(u_leak, v_leak)
+        e["pred_is_leaking"] = max(u_leak, v_leak)
 
-            # Evaluate network-level leak detection
-            is_network_leaking = int(len(active_leaks) > 0)
-            network_y_true = [is_network_leaking]
-            network_y_pred = [det_flag] if det_flag is not None else [0]
+    # Evaluate network-level leak detection
+    is_network_leaking = int(len(active_leaks) > 0)
+    network_y_true = [is_network_leaking]
+    network_y_pred = [det_flag] if det_flag is not None else [0]
 
-            # ------------------------------------------------------------------
-            # LSTM BURST PREDICTOR (Inline)
-            # ------------------------------------------------------------------
-            p_map_live = {str(n["id"]).strip(): float(n["pressure"]) for n in graph_nodes}
-            p_snap     = np.array([p_map_live.get(nid, 0.0) for nid in BIWS_NODE_ORDER],
-                                   dtype=np.float32)
+    # ------------------------------------------------------------------
+    # LSTM BURST PREDICTOR (Inline)
+    # ------------------------------------------------------------------
+    p_map_live = {str(n["id"]).strip(): float(n["pressure"]) for n in graph_nodes}
+    p_snap     = np.array([p_map_live.get(nid, 0.0) for nid in BIWS_NODE_ORDER],
+                           dtype=np.float32)
 
-            top_burst_nodes: List[Dict] = []
-            ttb = []
+    top_burst_nodes: List[Dict] = []
+    ttb = []
+    
+    if lstm_model is not None:
+        # WARMSTART: If buffer is empty, copy the very first snapshot N times so predictions start instantly!
+        if len(pressure_history) == 0:
+            for _ in range(LSTM_SEQ_LEN):
+                pressure_history.append(p_snap)
+        else:
+            pressure_history.append(p_snap)
 
-            if lstm_model is not None:
-                # WARMSTART: If buffer is empty, copy the very first snapshot N times so predictions start instantly!
-                if len(pressure_history) == 0:
-                    for _ in range(LSTM_SEQ_LEN):
-                        pressure_history.append(p_snap)
-                else:
-                    pressure_history.append(p_snap)
+        #try:
+        t0 = time.time()
+        
+        from lstm_data import build_inference_tensor
+        snap_list = list(pressure_history)
+        X_t = build_inference_tensor(snap_list, BIWS_NODE_ORDER)
 
-                try:
-                    t0 = time.time()
+        with torch.no_grad():
+            ttb_raw = lstm_model(X_t).numpy()   # (N_NODES,)
 
-                    from lstm_data import build_inference_tensor
-                    snap_list = list(pressure_history)
-                    X_t = build_inference_tensor(snap_list, BIWS_NODE_ORDER)
+        ttb = np.clip(ttb_raw, 0, LSTM_HORIZON)
 
-                    with torch.no_grad():
-                        ttb_raw = lstm_model(X_t).numpy()   # (N_NODES,)
+        TOP_K = 10
+        top_idxs = np.argsort(ttb)[:TOP_K]
 
-                    ttb = np.clip(ttb_raw, 0, LSTM_HORIZON)
+        for idx in top_idxs:
+            nid = BIWS_NODE_ORDER[idx]
+            props = node_physical_props.get(nid, {})
+            risk_score = (
+                (props.get("age", 40) / 80.0)           * 0.2 +
+                props.get("corrosion_idx", 0.5)          * 0.2 +
+                (props.get("length", 100) / 1000.0)     * 0.1 +
+                (props.get("avg_pressure", 60) / 100.0) * 0.1 +
+                (props.get("press_var", 2) / 10.0)      * 0.2 +
+                props.get("soil_corr_idx", 0.5)          * 0.2
+            )
+            pred_ttb = float(ttb[idx])
+            urgency = "CRITICAL" if pred_ttb <= 2 else \
+                      "HIGH"     if pred_ttb <= 5 else \
+                      "MEDIUM"   if pred_ttb <= 10 else "LOW"
 
-                    TOP_K = 10
-                    top_idxs = np.argsort(ttb)[:TOP_K]
+            top_burst_nodes.append({
+                "node_id":       nid,
+                "time_to_burst": round(pred_ttb, 2),
+                "risk_score":    round(float(risk_score), 4),
+                "urgency":       urgency,
+            })
 
-                    for idx in top_idxs:
-                        nid = BIWS_NODE_ORDER[idx]
-                        props = node_physical_props.get(nid, {})
-                        risk_score = (
-                            (props.get("age", 40) / 80.0)           * 0.2 +
-                            props.get("corrosion_idx", 0.5)          * 0.2 +
-                            (props.get("length", 100) / 1000.0)     * 0.1 +
-                            (props.get("avg_pressure", 60) / 100.0) * 0.1 +
-                            (props.get("press_var", 2) / 10.0)      * 0.2 +
-                            props.get("soil_corr_idx", 0.5)          * 0.2
-                        )
-                        pred_ttb = float(ttb[idx])
-                        urgency = "CRITICAL" if pred_ttb <= 2 else \
-                                  "HIGH"     if pred_ttb <= 5 else \
-                                  "MEDIUM"   if pred_ttb <= 10 else "LOW"
+        # Map LSTM predictions back to the full graph for metrics calculation
+        # (Assume TTB <= 5 mins represents an active or highly imminent leak)
+        node_idx_map = {n["id"]: idx for idx, n in enumerate(graph_nodes)}
+        for i, nid in enumerate(BIWS_NODE_ORDER):
+            if nid in node_idx_map:
+                g_node = graph_nodes[node_idx_map[nid]]
+                g_node["pred_is_leaking"] = 1 if ttb[i] <= 5.0 else 0
+                
+        for e in graph_edges:
+            u = str(e.get("from", "")).strip()
+            v = str(e.get("to", "")).strip()
+            u_leak = 1 if u in node_idx_map and graph_nodes[node_idx_map[u]].get("pred_is_leaking") == 1 else 0
+            v_leak = 1 if v in node_idx_map and graph_nodes[node_idx_map[v]].get("pred_is_leaking") == 1 else 0
+            e["pred_is_leaking"] = max(u_leak, v_leak)
 
-                        top_burst_nodes.append({
-                            "node_id":       nid,
-                            "time_to_burst": round(pred_ttb, 2),
-                            "risk_score":    round(float(risk_score), 4),
-                            "urgency":       urgency,
-                        })
+        t1 = time.time()
+        print(f"  [LSTM Inference] Scored {len(ttb)} nodes in {(t1-t0)*1000:.1f}ms. "
+              f"Most urgent: {top_burst_nodes[0]['node_id']} ({top_burst_nodes[0]['time_to_burst']} min)")
+        #except Exception as ex:
+            #print(f"  [LSTM Inference] Error: {ex}")
+            #top_burst_nodes = []
 
-                    # Map LSTM predictions back to the full graph for metrics calculation
-                    # (Assume TTB <= 5 mins represents an active or highly imminent leak)
-                    node_idx_map = {n["id"]: idx for idx, n in enumerate(graph_nodes)}
-                    for i, nid in enumerate(BIWS_NODE_ORDER):
-                        if nid in node_idx_map:
-                            g_node = graph_nodes[node_idx_map[nid]]
-                            g_node["pred_is_leaking"] = 1 if ttb[i] <= 5.0 else 0
+    # Determine Node & Pipe Metrics based on populated targets
+    node_y_true = [int(n.get("is_leaking", 0)) for n in graph_nodes]
+    node_y_pred = [int(n.get("pred_is_leaking", 0)) for n in graph_nodes]
+    pipe_y_true = [int(e.get("is_leaking", 0)) for e in graph_edges]
+    pipe_y_pred = [int(e.get("pred_is_leaking", 0)) for e in graph_edges]
 
-                    for e in graph_edges:
-                        u = str(e.get("from", "")).strip()
-                        v = str(e.get("to", "")).strip()
-                        u_leak = 1 if u in node_idx_map and graph_nodes[node_idx_map[u]].get("pred_is_leaking") == 1 else 0
-                        v_leak = 1 if v in node_idx_map and graph_nodes[node_idx_map[v]].get("pred_is_leaking") == 1 else 0
-                        e["pred_is_leaking"] = max(u_leak, v_leak)
+    # ------------------------------------------------------------------
+    # Output generation
+    # ------------------------------------------------------------------
+    snapshot = {
+        "nodes": graph_nodes,
+        "edges": graph_edges,
+        "metrics": {
+            "network": _binary_metrics(network_y_true, network_y_pred),
+            "nodes": _binary_metrics(node_y_true, node_y_pred),
+            "pipes": _binary_metrics(pipe_y_true, pipe_y_pred),
+            "model_loaded": bool(leak_model is not None),
+        },
+        "prediction": {
+            "top_nodes":      top_burst_nodes,
+            "n_nodes_scored": len(ttb),
+            "horizon_min":    LSTM_HORIZON,
+            "buffer_ready":   len(pressure_history) == LSTM_SEQ_LEN,
+            "model_loaded":   bool(lstm_model is not None),
+        },
+        
+        "timestamp": current_time
+    }
+    print(graph_nodes[0])
+    return snapshot
 
-                    t1 = time.time()
-                    print(f"  [LSTM Inference] Scored {len(ttb)} nodes in {(t1-t0)*1000:.1f}ms. "
-                          f"Most urgent: {top_burst_nodes[0]['node_id']} ({top_burst_nodes[0]['time_to_burst']} min)")
-                except Exception as ex:
-                    print(f"  [LSTM Inference] Error: {ex}")
-                    top_burst_nodes = []
-
-            # Determine Node & Pipe Metrics based on populated targets
-            node_y_true = [int(n.get("is_leaking", 0)) for n in graph_nodes]
-            node_y_pred = [int(n.get("pred_is_leaking", 0)) for n in graph_nodes]
-            pipe_y_true = [int(e.get("is_leaking", 0)) for e in graph_edges]
-            pipe_y_pred = [int(e.get("pred_is_leaking", 0)) for e in graph_edges]
-
-            # ------------------------------------------------------------------
-            # Output generation
-            # ------------------------------------------------------------------
-            snapshot = {
-                "nodes": graph_nodes,
-                "edges": graph_edges,
-                "metrics": {
-                    "network": _binary_metrics(network_y_true, network_y_pred),
-                    "nodes": _binary_metrics(node_y_true, node_y_pred),
-                    "pipes": _binary_metrics(pipe_y_true, pipe_y_pred),
-                    "model_loaded": bool(leak_model is not None),
-                },
-                "prediction": {
-                    "top_nodes":      top_burst_nodes,
-                    "n_nodes_scored": len(ttb),
-                    "horizon_min":    LSTM_HORIZON,
-                    "buffer_ready":   len(pressure_history) == LSTM_SEQ_LEN,
-                    "model_loaded":   bool(lstm_model is not None),
-                },
-                "timestamp": current_time
-            }
-
-            stream_buffer.clear()
-            stream_buffer.append(snapshot)
-
-            # sleep between cycles
-            time.sleep(5)
-
-        except Exception as e:
-            print("Simulation Error:", e)
-            # slight pause to avoid busy-loop on persistent failure
-            time.sleep(1)
+    #except Exception as e:
+        #print("Simulation Error:", e)
+        #return None
 
 
-
-@app.on_event("startup")
-def start_background_workers():
-    # simulation_worker: runs every 5s, feeds /stream with live network data
-    threading.Thread(target=simulation_worker, daemon=True).start()
 
 @app.get("/")
 def home():
@@ -610,8 +610,16 @@ def home():
 
 @app.get("/stream")
 def stream_data():
-    """Live simulation data — nodes, edges, detection metrics, AND LSTM predictions. Updated every ~5s."""
-    return {"data": stream_buffer}
+    try:
+        snapshot = simulation_worker_step()
+        if snapshot is not None:
+            print(f"Simulation step completed | Leaks: {len([n for n in snapshot['nodes'] if n.get('is_leaking')])} nodes", flush=True)
+            return {"data": [snapshot]}
+        else:
+            return {"data": []}
+    except Exception as e:
+        print("Simulation step error:", e, flush=True)
+        return {"data": []}
 
 if __name__ == "__main__":
     import uvicorn

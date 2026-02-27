@@ -56,8 +56,8 @@ const seededRandom = (seed: number) => {
 // Generate realistic pipeline network coordinates
 // Simulates a water distribution network with main lines and branches
 const generateHeatmapPoints = (data: HeatmapData): HeatmapPoint[] => {
-  const baseCoords = { lat: 28.6139, lng: 77.2090 }; // New Delhi, India
-  const networkSpread = 0.035; // Wider area coverage
+  const baseCoords = { lat: 22.719568, lng: 75.857727 }; // Indore, India
+  const networkSpread = 0.015; // Wider area coverage
   
   // Create multiple pipeline "branches" for realistic distribution
   const branches = [
