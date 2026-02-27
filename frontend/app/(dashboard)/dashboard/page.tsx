@@ -8,6 +8,9 @@ import { KPICard } from '@/components/dashboard/kpi-card';
 import { AlertFeed } from '@/components/dashboard/alert-feed';
 import { MiniMap } from '@/components/dashboard/mini-map';
 import { PressureHeatmap } from '@/components/dashboard/pressure-heatmap';
+import { PipelineNetworkGraph } from '@/components/dashboard/pipeline-network-graph';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Eye, Brain } from 'lucide-react';
 
 // Types for pipeline data
 interface RiskNode {
@@ -21,6 +24,35 @@ interface PipelineData {
   pressure: number[];
   risk_nodes: RiskNode[];
   timestamp?: number;
+}
+
+// Types for network graph data (from /stream endpoint)
+interface GraphNode {
+  id: string;
+  x: number;
+  y: number;
+  pressure: number;
+  is_leaking: number;
+  pred_leak_prob?: number;
+  pred_is_leaking?: number;
+}
+
+interface GraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  type: string;
+  length?: number;
+  diameter?: number;
+  flowrate?: number;
+  is_leaking: number;
+  pred_leak_prob?: number;
+  pred_is_leaking?: number;
+}
+
+interface NetworkData {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
 }
 
 // Mock data
@@ -85,6 +117,7 @@ export default function DashboardPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [pipelineData, setPipelineData] = useState<PipelineData | null>(null);
   const [pressureChartData, setPressureChartData] = useState<{ node: string; pressure: number }[]>([]);
+  const [networkData, setNetworkData] = useState<NetworkData | null>(null);
 
   // Fetch pipeline pressure data from backend API
   useEffect(() => {
@@ -93,32 +126,92 @@ export default function DashboardPage() {
         const res = await fetch('http://127.0.0.1:8000/stream');
         const json = await res.json();
         
-        if (json.data && json.data.length > 0) {
-          const latest = json.data[0];
+        // Check for new data format with nodes/edges objects
+        if (json.nodes && json.edges) {
+          // New format: nodes and edges are objects with full data
+          setNetworkData({
+            nodes: json.nodes,
+            edges: json.edges,
+          });
           
-          // Transform data for chart
-          const chartData = latest.nodes.map((node: string, index: number) => ({
-            node,
-            pressure: latest.pressure[index],
+          // Also create pressure chart data from nodes
+          const chartData = json.nodes.slice(0, 20).map((node: GraphNode) => ({
+            node: node.id,
+            pressure: node.pressure,
           }));
           setPressureChartData(chartData);
           
-          // Transform risk_nodes from array of strings to array of objects
-          // The backend returns risk_nodes as string[] (node names with low pressure)
-          const transformedRiskNodes: RiskNode[] = (latest.risk_nodes || []).map((nodeName: string) => {
-            const nodeIndex = latest.nodes.indexOf(nodeName);
-            const pressure = nodeIndex >= 0 ? latest.pressure[nodeIndex] : 0;
-            // Determine risk level based on pressure
-            const risk_level = pressure < 0.5 ? 'high' : pressure < 1.0 ? 'medium' : 'low';
-            return { node: nodeName, risk_level, pressure };
-          });
+          // Create risk nodes from leaking nodes
+          const riskNodes: RiskNode[] = json.nodes
+            .filter((n: GraphNode) => n.is_leaking === 1 || (n.pred_leak_prob && n.pred_leak_prob > 0.3))
+            .map((n: GraphNode) => ({
+              node: n.id,
+              risk_level: n.is_leaking === 1 ? 'high' : n.pred_leak_prob && n.pred_leak_prob > 0.5 ? 'medium' : 'low',
+              pressure: n.pressure,
+            }));
           
           setPipelineData({
-            nodes: latest.nodes,
-            pressure: latest.pressure,
-            risk_nodes: transformedRiskNodes,
-            timestamp: latest.timestamp,
+            nodes: json.nodes.map((n: GraphNode) => n.id),
+            pressure: json.nodes.map((n: GraphNode) => n.pressure),
+            risk_nodes: riskNodes,
+            timestamp: json.timestamp,
           });
+        } else if (json.data && json.data.length > 0) {
+          // Data array format from /stream endpoint
+          const latest = json.data[0];
+          
+          // Set network data for the PipelineNetworkGraph component
+          if (latest.nodes && latest.edges) {
+            setNetworkData({
+              nodes: latest.nodes,
+              edges: latest.edges,
+            });
+            
+            // Create pressure chart data from nodes
+            const chartData = latest.nodes.slice(0, 20).map((node: GraphNode) => ({
+              node: node.id,
+              pressure: node.pressure,
+            }));
+            setPressureChartData(chartData);
+            
+            // Create risk nodes from leaking nodes
+            const riskNodes: RiskNode[] = latest.nodes
+              .filter((n: GraphNode) => n.is_leaking === 1 || (n.pred_leak_prob && n.pred_leak_prob > 0.3))
+              .map((n: GraphNode) => ({
+                node: n.id,
+                risk_level: n.is_leaking === 1 ? 'high' : n.pred_leak_prob && n.pred_leak_prob > 0.5 ? 'medium' : 'low',
+                pressure: n.pressure,
+              }));
+            
+            setPipelineData({
+              nodes: latest.nodes.map((n: GraphNode) => n.id),
+              pressure: latest.nodes.map((n: GraphNode) => n.pressure),
+              risk_nodes: riskNodes,
+              timestamp: latest.timestamp,
+            });
+          } else {
+            // Legacy format with nodes as string array
+            const chartData = latest.nodes.map((node: string, index: number) => ({
+              node,
+              pressure: latest.pressure[index],
+            }));
+            setPressureChartData(chartData);
+            
+            // Transform risk_nodes from array of strings to array of objects
+            const transformedRiskNodes: RiskNode[] = (latest.risk_nodes || []).map((nodeName: string) => {
+              const nodeIndex = latest.nodes.indexOf(nodeName);
+              const pressure = nodeIndex >= 0 ? latest.pressure[nodeIndex] : 0;
+              const risk_level = pressure < 0.5 ? 'high' : pressure < 1.0 ? 'medium' : 'low';
+              return { node: nodeName, risk_level, pressure };
+            });
+            
+            setPipelineData({
+              nodes: latest.nodes,
+              pressure: latest.pressure,
+              risk_nodes: transformedRiskNodes,
+              timestamp: latest.timestamp,
+            });
+          }
         }
       } catch (error) {
         console.log('API fetch error, using mock data:', error);
@@ -209,6 +302,48 @@ export default function DashboardPage() {
         } : null}
         isLoading={!pipelineData}
       />
+
+      {/* Pipeline Network Graph with Tabs */}
+      <div className="bg-white/80 backdrop-blur-sm rounded-2xl border border-slate-200 shadow-lg p-6">
+        <Tabs defaultValue="detection" className="w-full">
+          <TabsList className="grid w-full max-w-md grid-cols-2 mb-6">
+            <TabsTrigger value="detection" className="flex items-center gap-2">
+              <Eye className="w-4 h-4" />
+              Detection System
+            </TabsTrigger>
+            <TabsTrigger value="predictive" className="flex items-center gap-2">
+              <Brain className="w-4 h-4" />
+              Predictive System
+            </TabsTrigger>
+          </TabsList>
+          
+          <TabsContent value="detection">
+            <div className="mb-4">
+              <h3 className="text-lg font-semibold text-slate-900">Real-time Leak Detection</h3>
+              <p className="text-sm text-slate-500">Monitoring active leaks in the pipeline network</p>
+            </div>
+            <PipelineNetworkGraph
+              nodes={networkData?.nodes || []}
+              edges={networkData?.edges || []}
+              isLoading={!networkData}
+              mode="detection"
+            />
+          </TabsContent>
+          
+          <TabsContent value="predictive">
+            <div className="mb-4">
+              <h3 className="text-lg font-semibold text-slate-900">Predictive Leak Analysis</h3>
+              <p className="text-sm text-slate-500">ML-based prediction of potential leak locations</p>
+            </div>
+            <PipelineNetworkGraph
+              nodes={networkData?.nodes || []}
+              edges={networkData?.edges || []}
+              isLoading={!networkData}
+              mode="predictive"
+            />
+          </TabsContent>
+        </Tabs>
+      </div>
 
       {/* Charts and Alerts */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
