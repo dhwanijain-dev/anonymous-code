@@ -1,122 +1,114 @@
-import os
+"""
+prediction_model.py
+===================
+Train the leak LOCALIZATION model (prediction.pkl).
 
+Given a full-network pressure snapshot the model predicts:
+  - Class 0  : no leak active right now
+  - Class k>=1: leak at the junction named  node_id_map[k]
+
+At inference (in main.py) the top-K class probabilities are returned so the
+dashboard can show a ranked list of the most likely leak locations.
+
+Outputs
+-------
+  model/prediction.pkl       — XGBoost multi-class classifier
+  model/node_id_map.pkl      — list[str], index=class → junction node ID
+                               (node_id_map[0] == 'no_leak')
+"""
+
+import os
 import joblib
 import numpy as np
+import xgboost as xgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
-import xgboost as xgb
 
-from prediction_data import build_dataset
+from node_prediction_data import build_localization_dataset
 
 
 # ============================
-# DEFAULT CONFIG (EDIT HERE)
+# CONFIG
 # ============================
-
-DATA_ROOT    = "./BiWSData"         # Path to BiWSData root (Scenario-* folders)
-HORIZON_STEPS = 0                   # 0 = current leak, >0 = future leak prediction
-MODEL_OUT    = "model/prediction.pkl"   # Output model file
+DATA_ROOT       = "./BiWSData"
+MODEL_OUT       = "model/prediction.pkl"
+NODE_MAP_OUT    = "model/node_id_map.pkl"
 
 
 def main() -> None:
-    # ----------------------------
-    # Validate paths
-    # ----------------------------
-    if not DATA_ROOT or not DATA_ROOT.strip():
-        raise ValueError("DATA_ROOT is empty. Please set it to the BiWSData directory.")
-
     if not os.path.isdir(DATA_ROOT):
-        raise FileNotFoundError(f"Data root directory does not exist: {DATA_ROOT}")
+        raise FileNotFoundError(f"Data root not found: {DATA_ROOT}")
 
     print("===================================")
-    print(" Training Leak Prediction Model")
+    print(" Training Leak Localization Model")
     print("===================================")
-    print(f"Data root     : {DATA_ROOT}")
-    print(f"Horizon steps : {HORIZON_STEPS}")
-    print(f"Model output  : {MODEL_OUT}")
+    print(f"Data root  : {DATA_ROOT}")
+    print(f"Model out  : {MODEL_OUT}")
+    print(f"Map out    : {NODE_MAP_OUT}\n")
 
-    # ----------------------------
-    # Load dataset
-    # ----------------------------
-    print("\nLoading dataset...")
-    df, X, y = build_dataset(
-        base_dir=DATA_ROOT,
-        horizon_steps=HORIZON_STEPS,
-    )
+    # ── Load multi-class dataset ───────────────────────────────────────
+    print("Loading localization dataset ...")
+    X, y, node_id_map = build_localization_dataset(DATA_ROOT)
 
-    print(f"Feature matrix shape: {X.shape}")
-    print(f"Label vector shape : {y.shape}")
+    n_classes = len(node_id_map)   # 0 = no_leak, 1..K = leak nodes
+    print(f"Feature matrix shape : {X.shape}")
+    print(f"Label vector shape   : {y.shape}")
+    print(f"Classes              : {n_classes}  (0=no_leak + {n_classes-1} unique leak nodes)")
 
     unique, counts = np.unique(y, return_counts=True)
-    print("\nClass balance (0 = no leak, 1 = leak):")
-    for label, count in zip(unique, counts):
-        print(f"  {label}: {count}")
+    print("\nClass balance:")
+    for cls, cnt in zip(unique, counts):
+        label = node_id_map[cls] if cls < len(node_id_map) else f"class_{cls}"
+        print(f"  class {cls:>4}  ({label:>12}) : {cnt}")
 
-    if len(unique) < 2 or (1 not in unique) or counts[list(unique).index(1)] == 0:
+    if len(unique) < 2:
         raise ValueError(
-            "No positive (leak) samples found in the dataset.\n"
-            "Check that Labels.csv files contain Label > 0."
+            "Only one class found in the dataset.\n"
+            "Re-generate BiWSData with leak scenarios present."
         )
 
-    # ----------------------------
-    # Train / test split
-    # ----------------------------
+    # ── Train / test split ─────────────────────────────────────────────
     X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.2,
-        random_state=42,
-        stratify=y,
+        X, y, test_size=0.2, random_state=42, stratify=y,
     )
+    print(f"\nTrain rows: {len(X_train)}  |  Test rows: {len(X_test)}")
 
-    n_neg = int((y_train == 0).sum())
-    n_pos = int((y_train == 1).sum())
-
-    if n_pos == 0:
-        raise ValueError("No positive samples in training split.")
-
-    scale_pos_weight = n_neg / n_pos
-    print("\nTraining split:")
-    print(f"  Normal samples: {n_neg}")
-    print(f"  Leak samples  : {n_pos}")
-    print(f"  scale_pos_weight = {scale_pos_weight:.2f}")
-
-    # ----------------------------
-    # Train XGBoost model
-    # ----------------------------
+    # ── XGBoost multi-class ────────────────────────────────────────────
     model = xgb.XGBClassifier(
-        n_estimators=200,
-        learning_rate=0.05,
-        max_depth=6,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=scale_pos_weight,
-        random_state=42,
-        eval_metric="logloss",
-        n_jobs=-1,
+        objective        = "multi:softprob",
+        num_class        = n_classes,
+        n_estimators     = 200,
+        learning_rate    = 0.05,
+        max_depth        = 6,
+        subsample        = 0.8,
+        colsample_bytree = 0.8,
+        random_state     = 42,
+        eval_metric      = "mlogloss",
+        n_jobs           = -1,
     )
 
-    print("\nFitting XGBoost model...")
+    print("\nFitting XGBoost localization model ...")
     model.fit(X_train, y_train)
 
-    # ----------------------------
-    # Evaluation
-    # ----------------------------
+    # ── Evaluation ─────────────────────────────────────────────────────
     print("\n--- Evaluation on held-out data ---")
     y_pred = model.predict(X_test)
 
     print("Confusion Matrix:")
     print(confusion_matrix(y_test, y_pred))
 
+    # Use node names as target_names for the report
+    target_names = [f"cls{i}({node_id_map[i]})" for i in sorted(unique)]
     print("\nClassification Report:")
-    print(classification_report(y_test, y_pred, digits=3))
+    print(classification_report(y_test, y_pred, target_names=target_names, digits=3))
 
-    # ----------------------------
-    # Save model
-    # ----------------------------
+    # ── Save ───────────────────────────────────────────────────────────
     os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
-    joblib.dump(model, MODEL_OUT)
-    print(f"\nModel saved successfully to: {MODEL_OUT}")
+    joblib.dump(model,       MODEL_OUT)
+    joblib.dump(node_id_map, NODE_MAP_OUT)
+    print(f"Localization model saved  → {MODEL_OUT}")
+    print(f"Node ID map saved         → {NODE_MAP_OUT}")
+    print(f"  (node_id_map[0]='no_leak', node_id_map[1..{n_classes-1}]=leak junction IDs)")
 
 
 if __name__ == "__main__":
