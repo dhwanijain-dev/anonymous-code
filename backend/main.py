@@ -71,7 +71,13 @@ pipe_physical_props = {}
 # (must match lstm_model.py exactly)
 # ============================
 class LeakLSTM(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float):
+    """
+    LSTM time-to-burst REGRESSION model.
+    Output is a raw float (no activation) = predicted timesteps until burst.
+    0 = bursting now,  HORIZON = no near-term risk.
+    """
+    def __init__(self, input_size: int, hidden_size: int,
+                 num_layers: int, dropout: float):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size  = input_size,
@@ -80,17 +86,17 @@ class LeakLSTM(nn.Module):
             batch_first = True,
             dropout     = dropout if num_layers > 1 else 0.0,
         )
+        # Regression head — NO sigmoid
         self.head = nn.Sequential(
             nn.Linear(hidden_size, 32),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(32, 1),
-            nn.Sigmoid(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.lstm(x)
-        return self.head(out[:, -1, :]).squeeze(-1)
+        return self.head(out[:, -1, :]).squeeze(-1)   # (batch,) raw float
 
 
 # ============================
@@ -148,12 +154,17 @@ for pipe_name in getattr(wn_init, "pipe_name_list", []):
         continue
 
 # ============================
-# ROLLING PRESSURE HISTORY BUFFER
-# (used by LSTM burst predictor)
+# BUFFERS
 # ============================
-LSTM_SEQ_LEN = lstm_config.get("seq_len", 10)   # matches lstm_data.SEQ_LEN
-# Each element is a numpy array of shape (N_MODEL_FEATURES,) — ordered by BIWS_NODE_ORDER
+
+# /stream  — live simulation snapshots (updated every ~5s)
+stream_buffer: List[Dict] = []
+
+# Rolling pressure history used by LSTM burst predictor to build the SEQ_LEN window
+LSTM_SEQ_LEN     = lstm_config.get("seq_len",  10)
+LSTM_HORIZON     = lstm_config.get("horizon",  20)
 pressure_history: deque = deque(maxlen=LSTM_SEQ_LEN)
+
 
 # ============================
 # SIMULATION WORKER
@@ -450,106 +461,58 @@ def simulation_worker():
                     det_prob = None
                     det_flag = None
 
-            # Attach the same network-level detection result to every node
+            # ------------------------------------------------------------------
+            # We DO NOT spray the network-level det_flag onto every single node! 
+            # Doing so causes 2,869 False Positives.
+            # Instead, the frontend should look at the LSTM 'prediction' block 
+            # to see WHICH specific nodes are at risk.
+            # ------------------------------------------------------------------
             for n in graph_nodes:
-                n["pred_leak_prob"] = det_prob
-                n["pred_is_leaking"] = det_flag
+                n["pred_leak_prob"] = 0.0
+                n["pred_is_leaking"] = 0
 
-            # Pipe-level prediction: inherit the max of the two endpoint node probs
-            node_prob_map = {str(n["id"]).strip(): n.get("pred_leak_prob") for n in graph_nodes}
             for e in graph_edges:
-                u = str(e.get("from", "")).strip()
-                v = str(e.get("to", "")).strip()
-                pu = node_prob_map.get(u)
-                pv = node_prob_map.get(v)
-                probs = [p for p in [pu, pv] if isinstance(p, (int, float))]
-                p_pipe = max(probs) if probs else None
-                e["pred_leak_prob"] = _safe_float(p_pipe)
-                e["pred_is_leaking"] = int(p_pipe >= 0.5) if isinstance(p_pipe, (int, float)) else None
+                e["pred_leak_prob"] = 0.0
+                e["pred_is_leaking"] = 0
 
-            # Metrics vs actual leak flags from this simulation cycle
-            node_y_true = [int(n.get("is_leaking", 0)) for n in graph_nodes if n.get("pred_is_leaking") is not None]
-            node_y_pred = [int(n.get("pred_is_leaking", 0)) for n in graph_nodes if n.get("pred_is_leaking") is not None]
-            pipe_y_true = [int(e.get("is_leaking", 0)) for e in graph_edges if e.get("pred_is_leaking") is not None]
-            pipe_y_pred = [int(e.get("pred_is_leaking", 0)) for e in graph_edges if e.get("pred_is_leaking") is not None]
+            # Evaluate network-level leak detection
+            is_network_leaking = int(len(active_leaks) > 0)
+            network_y_true = [is_network_leaking]
+            network_y_pred = [det_flag] if det_flag is not None else [0]
 
             # ------------------------------------------------------------------
-            # LSTM BURST PREDICTOR  — P(node will burst within next HORIZON steps)
+            # LSTM BURST PREDICTOR (Inline)
             # ------------------------------------------------------------------
-            # After each simulation cycle we push the current pressure snapshot
-            # into a rolling deque of length SEQ_LEN.  Once the buffer is full
-            # we build a (N_NODES, SEQ_LEN, 10) feature tensor for ALL 2,859
-            # BIWS junctions simultaneously and run a single batched LSTM forward
-            # pass — giving per-node burst probabilities in one shot.
-            #
-            # Features at each timestep (10 per node, all RELATIVE so the model
-            # generalises to every junction including unseen ones):
-            #   pressure_abs, pressure_dev, pressure_zscore, pressure_pct_rank,
-            #   net_mean, net_std, net_min, net_max, pressure_ratio, pressure_norm
-            # ------------------------------------------------------------------
-            top_burst_nodes: List[Dict] = []
-
-            # Step 1 — push current snapshot into rolling buffer
             p_map_live = {str(n["id"]).strip(): float(n["pressure"]) for n in graph_nodes}
             p_snap     = np.array([p_map_live.get(nid, 0.0) for nid in BIWS_NODE_ORDER],
-                                   dtype=np.float32)  # (N_NODES,)
-            pressure_history.append(p_snap)
+                                   dtype=np.float32)
 
-            # Step 2 — run LSTM only when buffer is full
-            if lstm_model is not None and len(pressure_history) == LSTM_SEQ_LEN:
+            top_burst_nodes: List[Dict] = []
+            ttb = []
+
+            if lstm_model is not None:
+                # WARMSTART: If buffer is empty, copy the very first snapshot N times so predictions start instantly!
+                if len(pressure_history) == 0:
+                    for _ in range(LSTM_SEQ_LEN):
+                        pressure_history.append(p_snap)
+                else:
+                    pressure_history.append(p_snap)
+
                 try:
-                    # ── Build (N_NODES, SEQ_LEN, 10) feature tensor ──────────
-                    # For each timestep in the window, vectorise the 10 features
-                    # across all nodes simultaneously.
-                    snap_list = list(pressure_history)  # list of SEQ_LEN (N_NODES,) arrays
+                    t0 = time.time()
+                    
+                    from lstm_data import build_inference_tensor
+                    snap_list = list(pressure_history)
+                    X_t = build_inference_tensor(snap_list, BIWS_NODE_ORDER)
 
-                    feat_seq = []  # SEQ_LEN × (N_NODES, 10)
-                    for p_row in snap_list:
-                        n_n  = len(p_row)   # 2859
-                        mu   = p_row.mean()
-                        sig  = p_row.std() + 1e-6
-                        mn   = p_row.min()
-                        mx   = p_row.max()
-                        rng  = mx - mn + 1e-6
-
-                        # Vectorized percentile rank via argsort — O(N log N)
-                        # rank[i] = fraction of nodes with HIGHER pressure than node i
-                        # (closer to 1.0 = lowest pressure = most suspect)
-                        order      = np.argsort(p_row)[::-1]   # descending pressure order
-                        rank_pos   = np.empty(n_n, dtype=np.float32)
-                        rank_pos[order] = np.arange(n_n, dtype=np.float32) / n_n
-
-                        ts_feat = np.column_stack([
-                            p_row,                          # pressure_abs
-                            p_row - mu,                     # pressure_dev
-                            (p_row - mu) / sig,             # pressure_zscore
-                            rank_pos,                       # pressure_pct_rank (vectorized)
-                            np.full(n_n, mu,  dtype=np.float32),  # net_mean
-                            np.full(n_n, sig, dtype=np.float32),  # net_std
-                            np.full(n_n, mn,  dtype=np.float32),  # net_min
-                            np.full(n_n, mx,  dtype=np.float32),  # net_max
-                            p_row / (mu + 1e-6),            # pressure_ratio
-                            (p_row - mn) / rng,             # pressure_norm
-                        ]).astype(np.float32)               # (N_NODES=2859, 10)
-                        feat_seq.append(ts_feat)
-
-                    # Stack → (N_NODES, SEQ_LEN, 10)
-                    X_lstm = np.stack(feat_seq, axis=1)                 # (N_NODES, SEQ_LEN, 10)
-                    X_t    = torch.tensor(X_lstm, dtype=torch.float32)  # (N_NODES, SEQ_LEN, 10)
-
-                    # ── Single batched forward pass ───────────────────────────
                     with torch.no_grad():
-                        burst_probs = lstm_model(X_t).numpy()   # (N_NODES,)
+                        ttb_raw = lstm_model(X_t).numpy()   # (N_NODES,)
 
-                    # ── Rank ALL 2,859 nodes by burst probability ────────────
-                    # Every junction goes through the LSTM — we just surface the
-                    # top-K highest burst probabilities in the API response.
-                    TOP_K        = 10   # expose top-10 in API
-                    horizon      = lstm_config.get("horizon", 5)
-                    horizon_min  = horizon   # each timestep = 1 minute (60s step)
-                    n_scored     = len(burst_probs)   # should always be 2859
+                    ttb = np.clip(ttb_raw, 0, LSTM_HORIZON)
 
-                    top_idxs = np.argsort(burst_probs)[::-1][:TOP_K]
+                    TOP_K = 10
+                    top_idxs = np.argsort(ttb)[:TOP_K]
+
                     for idx in top_idxs:
                         nid = BIWS_NODE_ORDER[idx]
                         props = node_physical_props.get(nid, {})
@@ -561,34 +524,64 @@ def simulation_worker():
                             (props.get("press_var", 2) / 10.0)      * 0.2 +
                             props.get("soil_corr_idx", 0.5)          * 0.2
                         )
+                        pred_ttb = float(ttb[idx])
+                        urgency = "CRITICAL" if pred_ttb <= 2 else \
+                                  "HIGH"     if pred_ttb <= 5 else \
+                                  "MEDIUM"   if pred_ttb <= 10 else "LOW"
+
                         top_burst_nodes.append({
                             "node_id":       nid,
-                            "burst_prob":    round(float(burst_probs[idx]), 4),
+                            "time_to_burst": round(pred_ttb, 2),
                             "risk_score":    round(float(risk_score), 4),
-                            "horizon_min":   horizon_min,
+                            "urgency":       urgency,
                         })
 
-                    print(f"[LSTM] Scored {n_scored} nodes | "
-                          f"top burst_prob={burst_probs[top_idxs[0]]:.3f} "
-                          f"at node {BIWS_NODE_ORDER[top_idxs[0]]}")
+                    # Map LSTM predictions back to the full graph for metrics calculation
+                    # (Assume TTB <= 5 mins represents an active or highly imminent leak)
+                    node_idx_map = {n["id"]: idx for idx, n in enumerate(graph_nodes)}
+                    for i, nid in enumerate(BIWS_NODE_ORDER):
+                        if nid in node_idx_map:
+                            g_node = graph_nodes[node_idx_map[nid]]
+                            g_node["pred_is_leaking"] = 1 if ttb[i] <= 5.0 else 0
+                            
+                    for e in graph_edges:
+                        u = str(e.get("from", "")).strip()
+                        v = str(e.get("to", "")).strip()
+                        u_leak = 1 if u in node_idx_map and graph_nodes[node_idx_map[u]].get("pred_is_leaking") == 1 else 0
+                        v_leak = 1 if v in node_idx_map and graph_nodes[node_idx_map[v]].get("pred_is_leaking") == 1 else 0
+                        e["pred_is_leaking"] = max(u_leak, v_leak)
 
+                    t1 = time.time()
+                    print(f"  [LSTM Inference] Scored {len(ttb)} nodes in {(t1-t0)*1000:.1f}ms. "
+                          f"Most urgent: {top_burst_nodes[0]['node_id']} ({top_burst_nodes[0]['time_to_burst']} min)")
                 except Exception as ex:
-                    print(f"LSTM inference error: {ex}")
+                    print(f"  [LSTM Inference] Error: {ex}")
                     top_burst_nodes = []
 
+            # Determine Node & Pipe Metrics based on populated targets
+            node_y_true = [int(n.get("is_leaking", 0)) for n in graph_nodes]
+            node_y_pred = [int(n.get("pred_is_leaking", 0)) for n in graph_nodes]
+            pipe_y_true = [int(e.get("is_leaking", 0)) for e in graph_edges]
+            pipe_y_pred = [int(e.get("pred_is_leaking", 0)) for e in graph_edges]
+
+            # ------------------------------------------------------------------
+            # Output generation
+            # ------------------------------------------------------------------
             snapshot = {
                 "nodes": graph_nodes,
                 "edges": graph_edges,
                 "metrics": {
+                    "network": _binary_metrics(network_y_true, network_y_pred),
                     "nodes": _binary_metrics(node_y_true, node_y_pred),
                     "pipes": _binary_metrics(pipe_y_true, pipe_y_pred),
                     "model_loaded": bool(leak_model is not None),
                 },
                 "prediction": {
-                    "top_burst_nodes": top_burst_nodes,
-                    "n_nodes_scored":  len(burst_probs) if 'burst_probs' in dir() else 0,
-                    "buffer_ready":    len(pressure_history) == LSTM_SEQ_LEN,
-                    "model_loaded":    bool(lstm_model is not None),
+                    "top_nodes":      top_burst_nodes,
+                    "n_nodes_scored": len(ttb),
+                    "horizon_min":    LSTM_HORIZON,
+                    "buffer_ready":   len(pressure_history) == LSTM_SEQ_LEN,
+                    "model_loaded":   bool(lstm_model is not None),
                 },
                 "timestamp": current_time
             }
@@ -604,12 +597,11 @@ def simulation_worker():
             # slight pause to avoid busy-loop on persistent failure
             time.sleep(1)
 
-# ============================
-# SERVER STARTUP
-# ============================
+
 
 @app.on_event("startup")
-def start_simulation():
+def start_background_workers():
+    # simulation_worker: runs every 5s, feeds /stream with live network data
     threading.Thread(target=simulation_worker, daemon=True).start()
 
 @app.get("/")
@@ -618,6 +610,7 @@ def home():
 
 @app.get("/stream")
 def stream_data():
+    """Live simulation data — nodes, edges, detection metrics, AND LSTM predictions. Updated every ~5s."""
     return {"data": stream_buffer}
 
 if __name__ == "__main__":

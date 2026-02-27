@@ -228,15 +228,22 @@ def run_scenario(
     #    Rows before leak_start_time  → Label 0
     #    Rows at or after that time   → Label 1 (if any leak was injected)
     row_labels = []
+    leak_nodes_str = []
+    # Join the active leaks into a single string (often just 1 node)
+    leak_str = "|".join(sorted(list(leak_set))) if leak_set else ""
+
     for t_sec in time_index_seconds:
         if has_leak_scenario and int(t_sec) >= leak_start_time:
             row_labels.append(1.0)
+            leak_nodes_str.append(leak_str)
         else:
             row_labels.append(0.0)
+            leak_nodes_str.append("")
 
     labels = pd.DataFrame({
         "Timestamp": pressure_junctions.index.tolist(),
         "Label":     row_labels,
+        "Leak_node": leak_nodes_str,
     })
 
     # 6. Save
