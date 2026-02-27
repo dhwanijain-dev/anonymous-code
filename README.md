@@ -87,7 +87,39 @@ A full-stack IoT platform that:
 - Target false positive rate: **< 2%**
 - Model retrained weekly with labelled data from resolved alerts
 
+## Leakage Detection Model
+### The detection model uses:
+- Pipe Age (years)
+- Pipe Length (meters)
+- Pipe Diameter (mm)
+- Real-time Pressure (bar)
+- Corrosion Index (pipe material)
+- Soil Corrosivity Index
+
+### Methodology
+- Node-based mass balance analysis
+- Pressure anomaly detection
+- Segment-level localization logic
+- Residual-based pattern recognition
+
+### Output
+- Exact segment identification
+- Real-time alert trigger
+- Water loss estimation
+  
 ---
+
+## Predictive Failure Model
+### Inputs include:
+- Historical pressure trends
+- Pipe aging profile
+- Corrosion severity
+- Environmental stress factors
+
+### The model:
+- Continuously learns from incoming live data
+- Updates risk scores dynamically
+- Flags high-probability segments before failure
 
 ## 🖥️ Dashboard Pages
 
