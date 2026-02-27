@@ -237,8 +237,8 @@ export default function LeafletHeatmapInner({ points, minPressure, maxPressure }
     if (!mapRef.current || mapInstanceRef.current) return;
 
     const map = L.map(mapRef.current, {
-      center: [40.7128, -74.006],
-      zoom: 13,
+      center: [22.719568, 75.857727], // Indore
+      zoom: 15, // More zoomed in
       zoomControl: true,
     });
 

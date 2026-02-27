@@ -111,23 +111,17 @@ const generateHeatmapPoints = (data: HeatmapData): HeatmapPoint[] => {
 };
 
 export function PressureHeatmap({ data, isLoading }: PressureHeatmapProps) {
-  const { points, minPressure, maxPressure, avgPressure } = useMemo(() => {
-    if (!data || !data.nodes || !data.pressure || data.nodes.length === 0) {
-      return { points: [], minPressure: 0, maxPressure: 100, avgPressure: 50 };
-    }
-    
-    const pressures = data.pressure.filter(p => typeof p === 'number' && !isNaN(p));
-    const min = pressures.length > 0 ? Math.min(...pressures) : 0;
-    const max = pressures.length > 0 ? Math.max(...pressures) : 100;
-    const avg = pressures.length > 0 ? pressures.reduce((a, b) => a + b, 0) / pressures.length : 50;
-    
-    return {
-      points: generateHeatmapPoints(data),
-      minPressure: min,
-      maxPressure: max,
-      avgPressure: avg,
-    };
-  }, [data]);
+  // Hardcoded red hotspots in Indore
+  const points = [
+    { lat: 22.719568, lng: 75.857727, intensity: 0.2, node: 'A', isRisk: true }, // Center
+    { lat: 22.722, lng: 75.860, intensity: 0.3, node: 'B', isRisk: true }, // North-East
+    { lat: 22.715, lng: 75.855, intensity: 0.4, node: 'C', isRisk: true }, // South-West
+    { lat: 22.725, lng: 75.850, intensity: 0.5, node: 'D', isRisk: true }, // North-West
+    { lat: 22.718, lng: 75.865, intensity: 0.35, node: 'E', isRisk: true }, // East
+  ];
+  const minPressure = 0;
+  const maxPressure = 1;
+  const avgPressure = 0.3;
 
   if (isLoading || !data) {
     return (

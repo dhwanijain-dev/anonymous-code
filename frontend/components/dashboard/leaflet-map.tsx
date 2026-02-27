@@ -56,7 +56,7 @@ const createCustomIcon = (status: string) => {
 export default function LeafletMap({ 
   sensors, 
   center = [40.7128, -74.006], 
-  zoom = 14 
+  zoom = 20
 }: LeafletMapProps) {
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
