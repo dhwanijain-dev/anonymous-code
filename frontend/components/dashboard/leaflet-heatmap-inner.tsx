@@ -239,7 +239,7 @@ export default function LeafletHeatmapInner({ points, minPressure, maxPressure }
     const map = L.map(mapRef.current, {
       center: [40.7128, -74.006],
       zoom: 13,
-      zoomControl: false,
+      zoomControl: true,
     });
 
     // Add light tile layer

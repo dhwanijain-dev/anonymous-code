@@ -1,8 +1,8 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
-import { AlertCircle, TrendingUp, Droplet, Zap, Activity, Waves, AlertTriangle, RefreshCw } from 'lucide-react';
+import { AlertCircle, TrendingUp, Droplet, Zap, Activity, Waves, AlertTriangle, RefreshCw, Radio, Clock } from 'lucide-react';
 import { DashboardMetrics, Alert } from '@/lib/types';
 import { KPICard } from '@/components/dashboard/kpi-card';
 import { AlertFeed } from '@/components/dashboard/alert-feed';
@@ -12,6 +12,27 @@ import { PipelineNetworkGraph } from '@/components/dashboard/pipeline-network-gr
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Eye, Brain } from 'lucide-react';
 import { backendService, DerivedMetrics, DerivedAlert } from '@/lib/backend-service';
+
+// Types for BIWS LSTM burst prediction
+interface BurstNode {
+  node_id: string;
+  time_to_burst: number;
+  risk_score: number;
+  urgency: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+}
+
+interface PredictionInfo {
+  top_nodes: BurstNode[];
+  n_nodes_scored: number;
+  horizon_min: number;
+  buffer_ready: boolean;
+  model_loaded: boolean;
+}
+
+interface PressureHistoryPoint {
+  time: string;
+  [key: string]: string | number;
+}
 
 // Types for pipeline data
 interface RiskNode {
@@ -90,6 +111,15 @@ export default function DashboardPage() {
     { name: 'Critical', value: 5, color: '#ef4444' },
   ]);
   const [modelMetrics, setModelMetrics] = useState<{accuracy?: number; precision?: number; recall?: number; f1?: number}>({});
+
+  // BIWS Dashboard State
+  const [pressureHistory, setPressureHistory] = useState<PressureHistoryPoint[]>([]);
+  const [trackedNodes, setTrackedNodes] = useState<string[]>([]);
+  const [burstPrediction, setBurstPrediction] = useState<PredictionInfo | null>(null);
+  const [isNetworkAnomaly, setIsNetworkAnomaly] = useState(false);
+  const [networkLeakCount, setNetworkLeakCount] = useState(0);
+  const [totalMonitoredNodes, setTotalMonitoredNodes] = useState(0);
+  const trackedNodesRef = useRef<string[]>([]);
 
   // Fetch all dashboard data from backend
   const fetchDashboardData = useCallback(async () => {
@@ -243,6 +273,48 @@ export default function DashboardPage() {
               risk_nodes: transformedRiskNodes,
               timestamp: latest.timestamp,
             });
+           }
+        }
+
+        // ── BIWS Dashboard Data Extraction ──
+        // Extract data from whichever format we got
+        const db = json.data?.[0] || json;
+        if (db && db.nodes) {
+          const now = new Date().toLocaleTimeString();
+          setTotalMonitoredNodes(Array.isArray(db.nodes) ? db.nodes.length : 0);
+
+          // Network anomaly status
+          if (db.metrics?.network) {
+            const net = db.metrics.network;
+            const isLeaking = net.y_true?.[0] || net.tp > 0 || net.fp > 0;
+            setIsNetworkAnomaly(!!isLeaking);
+            setNetworkLeakCount(isLeaking ? (net.n || 1) : 0);
+          }
+
+          // Pick 3 tracked nodes on first run, then keep them stable
+          if (trackedNodesRef.current.length === 0 && Array.isArray(db.nodes) && db.nodes.length > 0) {
+            const shuffled = [...db.nodes].sort(() => 0.5 - Math.random());
+            const picked = shuffled.slice(0, 3).map((n: GraphNode) => n.id);
+            trackedNodesRef.current = picked;
+            setTrackedNodes(picked);
+          }
+
+          // Build pressure history point
+          if (trackedNodesRef.current.length > 0 && Array.isArray(db.nodes)) {
+            const point: PressureHistoryPoint = { time: now };
+            trackedNodesRef.current.forEach((nodeId: string) => {
+              const found = db.nodes.find((n: GraphNode) => n.id === nodeId);
+              point[`Node ${nodeId}`] = found ? found.pressure : 0;
+            });
+            setPressureHistory(prev => {
+              const updated = [...prev, point];
+              return updated.length > 20 ? updated.slice(-20) : updated;
+            });
+          }
+
+          // LSTM burst predictions
+          if (db.prediction) {
+            setBurstPrediction(db.prediction);
           }
         }
       } catch (error) {
@@ -379,6 +451,165 @@ export default function DashboardPage() {
             />
           </TabsContent>
         </Tabs>
+      </div>
+
+      {/* ── BIWS Detection & Time-to-Burst Dashboard ── */}
+      <div className="bg-white/80 backdrop-blur-sm rounded-2xl border border-slate-200 shadow-lg p-6">
+        {/* Card Header */}
+        <div className="text-center mb-6">
+          <h2 className="text-2xl font-bold text-slate-900">
+            Global Detection &amp; Time-to-Burst Dashboard
+          </h2>
+          <p className="text-slate-500 text-sm mt-1">
+            Real-time BIWS network simulation and predictive intelligence
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* Left: Network Status Monitor (2/3 width) */}
+          <div className="lg:col-span-2 bg-white/80 backdrop-blur-sm rounded-2xl border border-slate-200 shadow-lg p-6">
+            <div className="flex items-center justify-between mb-5">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-xl bg-gradient-to-br from-blue-500 to-cyan-500 shadow-lg">
+                  <Radio className="w-5 h-5 text-white" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-slate-900">Network Status Monitor</h3>
+                  <p className="text-sm text-slate-500">Live pressure tracking</p>
+                </div>
+              </div>
+              <span className={`text-xs font-semibold px-3 py-1.5 rounded-full ${
+                isNetworkAnomaly
+                  ? 'bg-red-100 text-red-700'
+                  : 'bg-emerald-100 text-emerald-700'
+              }`}>
+                {isNetworkAnomaly ? 'NETWORK ANOMALY DETECTED' : 'SYSTEM NORMAL'}
+              </span>
+            </div>
+
+            {/* Live Pressure Chart */}
+            <div className="h-[300px]">
+              {pressureHistory.length > 1 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={pressureHistory}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.1)" />
+                    <XAxis dataKey="time" stroke="rgba(0,0,0,0.4)" fontSize={11} tick={{ fill: '#64748b' }} />
+                    <YAxis stroke="rgba(0,0,0,0.4)" fontSize={11} tick={{ fill: '#64748b' }} label={{ value: 'Pressure', angle: -90, position: 'insideLeft', fill: '#64748b', fontSize: 12 }} />
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: 'white',
+                        border: '1px solid rgba(0,0,0,0.1)',
+                        borderRadius: '12px',
+                        color: '#0f172a',
+                        boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+                      }}
+                    />
+                    {trackedNodes.map((nodeId, i) => (
+                      <Line
+                        key={nodeId}
+                        type="monotone"
+                        dataKey={`Node ${nodeId}`}
+                        stroke={['#3b82f6', '#f97316', '#06b6d4'][i] || '#3b82f6'}
+                        strokeWidth={2}
+                        dot={false}
+                        isAnimationActive={false}
+                      />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="h-full flex items-center justify-center">
+                  <div className="text-center">
+                    <div className="w-10 h-10 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+                    <p className="text-sm text-slate-500">Waiting for pressure data...</p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Metrics Grid */}
+            <div className="grid grid-cols-2 gap-4 mt-5">
+              <div className="bg-slate-50 rounded-xl p-4 text-center border border-slate-200">
+                <div className="text-3xl font-bold text-blue-600">{totalMonitoredNodes}</div>
+                <div className="text-xs text-slate-500 mt-1 uppercase tracking-wider">Nodes Monitored</div>
+              </div>
+              <div className="bg-slate-50 rounded-xl p-4 text-center border border-slate-200">
+                <div className="text-3xl font-bold text-red-600">{networkLeakCount}</div>
+                <div className="text-xs text-slate-500 mt-1 uppercase tracking-wider">Network Leaks Detected</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Right: LSTM Burst Predictions (1/3 width) */}
+          <div className="bg-white/80 backdrop-blur-sm rounded-2xl border border-slate-200 shadow-lg p-6">
+            <div className="flex items-center justify-between mb-5">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 shadow-lg">
+                  <Clock className="w-5 h-5 text-white" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-slate-900">LSTM Burst Predictions</h3>
+                  <p className="text-sm text-slate-500">Time-to-burst forecast</p>
+                </div>
+              </div>
+              <span className={`text-xs font-semibold px-3 py-1.5 rounded-full ${
+                burstPrediction?.buffer_ready
+                  ? 'bg-emerald-100 text-emerald-700'
+                  : 'bg-amber-100 text-amber-700'
+              }`}>
+                {burstPrediction?.buffer_ready ? 'LIVE PREDICTION' : 'BUILDING BUFFER...'}
+              </span>
+            </div>
+
+            {/* Node Cards */}
+            <div className="flex flex-col gap-3 max-h-[460px] overflow-y-auto pr-2">
+              {burstPrediction?.top_nodes && burstPrediction.top_nodes.length > 0 ? (
+                burstPrediction.top_nodes.map((node) => (
+                  <div
+                    key={node.node_id}
+                    className={`rounded-xl p-4 flex items-center justify-between border transition-all duration-300 ${
+                      node.urgency === 'CRITICAL' ? 'bg-red-50 border-red-200' :
+                      node.urgency === 'HIGH' ? 'bg-amber-50 border-amber-200' :
+                      node.urgency === 'MEDIUM' ? 'bg-blue-50 border-blue-200' :
+                      'bg-slate-50 border-slate-200'
+                    }`}
+                  >
+                    <div>
+                      <div className="font-semibold text-slate-900 text-base">{node.node_id}</div>
+                      <div className="text-xs text-slate-500 mt-1">
+                        Risk: {node.risk_score.toFixed(2)}
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className={`text-xl font-bold ${
+                        node.urgency === 'CRITICAL' ? 'text-red-600' :
+                        node.urgency === 'HIGH' ? 'text-amber-600' :
+                        node.urgency === 'MEDIUM' ? 'text-blue-600' :
+                        'text-slate-600'
+                      }`}>
+                        {node.time_to_burst.toFixed(1)}{' '}
+                        <span className="text-sm font-normal text-slate-500">min</span>
+                      </div>
+                      <div className={`text-xs font-semibold uppercase ${
+                        node.urgency === 'CRITICAL' ? 'text-red-600' :
+                        node.urgency === 'HIGH' ? 'text-amber-600' :
+                        node.urgency === 'MEDIUM' ? 'text-blue-600' :
+                        'text-slate-500'
+                      }`}>{node.urgency}</div>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="h-48 flex items-center justify-center">
+                  <div className="text-center">
+                    <div className="w-10 h-10 border-2 border-purple-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+                    <p className="text-sm text-slate-500">Waiting for LSTM predictions...</p>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* Charts and Alerts */}
