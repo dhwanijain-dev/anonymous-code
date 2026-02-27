@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -61,9 +62,9 @@
             box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
             transition: transform 0.2s;
         }
-        
+
         .panel:hover {
-            border-color: rgba(255,255,255,0.2);
+            border-color: rgba(255, 255, 255, 0.2);
         }
 
         .panel-header {
@@ -83,8 +84,16 @@
             border-radius: 12px;
             font-weight: 600;
         }
-        .status-ok { background: rgba(16, 185, 129, 0.2); color: var(--accent-green); }
-        .status-alert { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
+
+        .status-ok {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--accent-green);
+        }
+
+        .status-alert {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--accent-red);
+        }
 
         /* LSTM Nodes Grid */
         .node-grid {
@@ -95,9 +104,15 @@
             overflow-y: auto;
             padding-right: 10px;
         }
-        
-        .node-grid::-webkit-scrollbar { width: 6px; }
-        .node-grid::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 10px; }
+
+        .node-grid::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .node-grid::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+        }
 
         .node-card {
             background: rgba(15, 23, 42, 0.6);
@@ -109,17 +124,31 @@
             align-items: center;
         }
 
-        .node-id { font-weight: 600; font-size: 1.1rem; }
-        
-        .ttb { 
-            font-size: 1.4rem; 
+        .node-id {
+            font-weight: 600;
+            font-size: 1.1rem;
+        }
+
+        .ttb {
+            font-size: 1.4rem;
             font-weight: 700;
         }
 
-        .urgency-CRITICAL { color: var(--accent-red); }
-        .urgency-HIGH { color: var(--accent-yellow); }
-        .urgency-MEDIUM { color: var(--accent-blue); }
-        .urgency-LOW { color: var(--text-muted); }
+        .urgency-CRITICAL {
+            color: var(--accent-red);
+        }
+
+        .urgency-HIGH {
+            color: var(--accent-yellow);
+        }
+
+        .urgency-MEDIUM {
+            color: var(--accent-blue);
+        }
+
+        .urgency-LOW {
+            color: var(--text-muted);
+        }
 
         /* Metrics Grid */
         .metrics-grid {
@@ -128,9 +157,9 @@
             gap: 15px;
             margin-top: 20px;
         }
-        
+
         .metric-box {
-            background: rgba(0,0,0,0.2);
+            background: rgba(0, 0, 0, 0.2);
             padding: 15px;
             border-radius: 12px;
             text-align: center;
@@ -150,11 +179,43 @@
             letter-spacing: 0.5px;
         }
 
+        /* Sync indicator animation */
+        .sync-pulse {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            margin-right: 6px;
+            box-shadow: 0 0 8px var(--accent-green);
+            animation: pulseFade 1s;
+        }
+
+        @keyframes pulseFade {
+            0% {
+                transform: scale(1);
+                opacity: 1;
+            }
+
+            50% {
+                transform: scale(1.5);
+                opacity: 0.8;
+            }
+
+            100% {
+                transform: scale(1);
+                opacity: 1;
+            }
+        }
+
         @media (max-width: 900px) {
-            .dashboard-container { grid-template-columns: 1fr; }
+            .dashboard-container {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
+
 <body>
 
     <h1>Global Detection & Time-to-Burst Dashboard</h1>
@@ -165,9 +226,15 @@
         <div class="panel">
             <h3 class="panel-header">
                 Network Status Monitor
-                <span id="network-status" class="status-badge status-ok">SYSTEM NORMAL</span>
+                <div>
+                    <span id="sync-indicator"
+                        style="font-size: 0.75rem; color: var(--text-muted); margin-right: 15px; display: none;">
+                        <span class="sync-pulse"></span>Data Synced
+                    </span>
+                    <span id="network-status" class="status-badge status-ok">SYSTEM NORMAL</span>
+                </div>
             </h3>
-            
+
             <div style="position: relative; height: 300px; width: 100%;">
                 <canvas id="pressureChart"></canvas>
             </div>
@@ -187,8 +254,9 @@
         <!-- LSTM Predictions Panel -->
         <div class="panel">
             <h3 class="panel-header">
-                LSTM Burst Predictions 
-                <span id="buffer-status" class="status-badge status-alert" style="background: rgba(245, 158, 11, 0.2); color: var(--accent-yellow)">BUILDING BUFFER</span>
+                LSTM Burst Predictions
+                <span id="buffer-status" class="status-badge status-alert"
+                    style="background: rgba(245, 158, 11, 0.2); color: var(--accent-yellow)">BUILDING BUFFER</span>
             </h3>
 
             <div id="node-grid" class="node-grid">
@@ -200,7 +268,7 @@
     <script>
         let chart;
         let pHistory = { labels: [], datasets: [] };
-        
+
         // Track up to 5 random nodes over time for the chart just to show live movement
         const trackNodesCount = 3;
 
@@ -208,38 +276,49 @@
             try {
                 const res = await fetch("/stream");
                 const json = await res.json();
-                
-                if(!json || !json.data || json.data.length === 0) return;
+
+                if (!json || !json.data || json.data.length === 0) return;
 
                 const db = json.data[0];
                 const now = new Date().toLocaleTimeString();
 
-                // 1. Update Top Level Metrics
-                const isLeaking = db.metrics.network.y_true?.[0] || db.metrics.network.tp > 0 || db.metrics.network.fp > 0;
+                // Flash the Sync Indicator so user knows data is updating
+                const syncInd = document.getElementById("sync-indicator");
+                syncInd.style.display = "inline-flex";
+                syncInd.style.alignItems = "center";
+                // Reset animation
+                const pulse = syncInd.querySelector('.sync-pulse');
+                pulse.style.animation = 'none';
+                pulse.offsetHeight;
+                pulse.style.animation = 'pulseFade 1s';
+
+                // 1. Update Top Level Metrics (resets every cycle)
+                const leakingNodeCount = db.nodes.filter(n => n.is_leaking === 1).length;
                 document.getElementById("metric-nodes").innerText = db.nodes.length;
-                
+                document.getElementById("metric-leaks").innerText = leakingNodeCount;
+
+                const isLeaking = leakingNodeCount > 0;
+
                 const statusBadge = document.getElementById("network-status");
-                if(isLeaking) {
+                if (isLeaking) {
                     statusBadge.className = "status-badge status-alert";
                     statusBadge.innerText = "NETWORK ANOMALY DETECTED";
-                    document.getElementById("metric-leaks").innerText = db.metrics.network.n || 1;
                 } else {
                     statusBadge.className = "status-badge status-ok";
                     statusBadge.innerText = "SYSTEM NORMAL";
-                    document.getElementById("metric-leaks").innerText = "0";
                 }
 
                 // 2. Update the Chart
                 if (!chart && db.nodes.length > 0) {
                     const ctx = document.getElementById("pressureChart");
-                    
+
                     // Pick random nodes to plot
                     const toPlot = db.nodes.sort(() => 0.5 - Math.random()).slice(0, trackNodesCount);
-                    
+
                     pHistory.datasets = toPlot.map((n, i) => ({
                         label: `Node ${n.id}`,
                         data: [n.pressure],
-                        borderColor: `hsl(${210 + (i*40)}, 80%, 65%)`,
+                        borderColor: `hsl(${210 + (i * 40)}, 80%, 65%)`,
                         borderWidth: 2,
                         tension: 0.4,
                         pointRadius: 0
@@ -255,7 +334,7 @@
                             plugins: { legend: { labels: { color: "#f8fafc" } } },
                             scales: {
                                 x: { ticks: { color: "#94a3b8" }, grid: { color: "rgba(255,255,255,0.05)" } },
-                                y: { ticks: { color: "#94a3b8" }, grid: { color: "rgba(255,255,255,0.05)" }, title: {display: true, text: 'Pressure', color: '#94a3b8'} }
+                                y: { ticks: { color: "#94a3b8" }, grid: { color: "rgba(255,255,255,0.05)" }, title: { display: true, text: 'Pressure', color: '#94a3b8' } }
                             }
                         }
                     });
@@ -265,21 +344,21 @@
                         pHistory.labels.shift();
                         pHistory.datasets.forEach(d => d.data.shift());
                     }
-                    
+
                     pHistory.labels.push(now);
-                    
+
                     pHistory.datasets.forEach((ds) => {
                         const node = db.nodes.find(n => `Node ${n.id}` === ds.label);
                         ds.data.push(node ? node.pressure : ds.data[ds.data.length - 1]);
                     });
-                    
+
                     chart.update('none'); // Update without full animation
                 }
 
                 // 3. Update LSTM Panel
                 const pred = db.prediction;
                 const bufferBadge = document.getElementById("buffer-status");
-                
+
                 if (pred.buffer_ready) {
                     bufferBadge.className = "status-badge status-ok";
                     bufferBadge.style = "";
@@ -293,13 +372,13 @@
                 if (pred.top_nodes && pred.top_nodes.length > 0) {
                     const grid = document.getElementById("node-grid");
                     grid.innerHTML = "";
-                    
+
                     pred.top_nodes.forEach(node => {
                         const div = document.createElement("div");
                         div.className = "node-card";
-                        
+
                         let subtitle = `Risk: ${node.risk_score.toFixed(2)}`;
-                        
+
                         div.innerHTML = `
                             <div>
                                 <div class="node-id">${node.node_id}</div>
@@ -313,7 +392,7 @@
                         grid.appendChild(div);
                     });
                 }
-            } catch(e) {
+            } catch (e) {
                 console.error("Dashboard error", e);
             }
         }
@@ -323,4 +402,5 @@
         updateDashboard();
     </script>
 </body>
+
 </html>
