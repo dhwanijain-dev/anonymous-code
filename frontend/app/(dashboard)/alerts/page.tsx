@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -11,72 +11,51 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { AlertCircle, CheckCircle, Clock, AlertTriangle, ChevronRight, Search, Filter } from 'lucide-react';
+import { AlertCircle, CheckCircle, Clock, AlertTriangle, ChevronRight, Search, Filter, RefreshCw } from 'lucide-react';
 import { Alert } from '@/lib/types';
 import { cn } from '@/lib/utils';
-
-// Mock data
-const mockAlerts: Alert[] = [
-  {
-    id: '1',
-    zone_id: 'zone-a',
-    alert_type: 'leak_detected',
-    severity: 'critical',
-    status: 'active',
-    description: 'High-pressure leak detected in Zone A-2',
-    location: 'Main Pipeline - Sector 2',
-    estimated_loss: 850,
-    created_at: new Date(Date.now() - 5 * 60000).toISOString(),
-  },
-  {
-    id: '2',
-    zone_id: 'zone-b',
-    alert_type: 'pressure_drop',
-    severity: 'high',
-    status: 'active',
-    description: 'Unusual pressure drop detected',
-    location: 'Secondary Line - Sector 5',
-    created_at: new Date(Date.now() - 15 * 60000).toISOString(),
-  },
-  {
-    id: '3',
-    zone_id: 'zone-c',
-    alert_type: 'flow_anomaly',
-    severity: 'medium',
-    status: 'acknowledged',
-    description: 'Flow rate exceeds expected parameters',
-    location: 'Zone C-1',
-    created_at: new Date(Date.now() - 45 * 60000).toISOString(),
-  },
-  {
-    id: '4',
-    alert_type: 'sensor_error',
-    severity: 'low',
-    status: 'resolved',
-    description: 'Sensor calibration drift detected',
-    location: 'Monitoring Point A3',
-    created_at: new Date(Date.now() - 120 * 60000).toISOString(),
-    resolved_at: new Date(Date.now() - 60 * 60000).toISOString(),
-  },
-  {
-    id: '5',
-    zone_id: 'zone-a',
-    alert_type: 'high_water_loss',
-    severity: 'high',
-    status: 'active',
-    description: 'Water loss exceeds threshold',
-    location: 'Zone A - Overall',
-    estimated_loss: 1200,
-    created_at: new Date(Date.now() - 2 * 60000).toISOString(),
-  },
-];
+import { backendService, DerivedAlert } from '@/lib/backend-service';
 
 export default function AlertsPage() {
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterSeverity, setFilterSeverity] = useState<string>('all');
   const [filterStatus, setFilterStatus] = useState<string>('all');
 
-  const filteredAlerts = mockAlerts.filter((alert) => {
+  // Fetch alerts from backend
+  const fetchAlerts = useCallback(async () => {
+    try {
+      const backendAlerts = await backendService.getAlerts();
+      const mappedAlerts: Alert[] = backendAlerts.map((a: DerivedAlert) => ({
+        id: a.id,
+        zone_id: a.zone_id,
+        sensor_id: a.sensor_id,
+        alert_type: a.alert_type,
+        severity: a.severity,
+        status: a.status,
+        description: a.description,
+        location: a.location,
+        estimated_loss: a.estimated_loss,
+        created_at: a.created_at,
+        acknowledged_at: a.acknowledged_at,
+        resolved_at: a.resolved_at,
+      }));
+      setAlerts(mappedAlerts);
+      setIsLoading(false);
+    } catch (error) {
+      console.error('Failed to fetch alerts:', error);
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchAlerts();
+    const interval = setInterval(fetchAlerts, 5000);
+    return () => clearInterval(interval);
+  }, [fetchAlerts]);
+
+  const filteredAlerts = alerts.filter((alert) => {
     const matchSearch = alert.description.toLowerCase().includes(searchTerm.toLowerCase());
     const matchSeverity = filterSeverity === 'all' || alert.severity === filterSeverity;
     const matchStatus = filterStatus === 'all' || alert.status === filterStatus;
@@ -126,11 +105,22 @@ export default function AlertsPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold text-slate-900">Alerts</h1>
-          <p className="text-slate-500 mt-1">Monitor and manage system alerts</p>
+          <p className="text-slate-500 mt-1">Monitor and manage system alerts (Live from simulation)</p>
         </div>
-        <div className="flex items-center gap-2 px-4 py-2 bg-red-50 text-red-700 rounded-xl text-sm font-medium border border-red-200">
-          <AlertCircle className="w-4 h-4" />
-          {mockAlerts.filter((a) => a.status === 'active').length} Active
+        <div className="flex items-center gap-3">
+          <Button
+            onClick={fetchAlerts}
+            variant="outline"
+            size="sm"
+            className="flex items-center gap-2"
+          >
+            <RefreshCw className={cn("w-4 h-4", isLoading && "animate-spin")} />
+            Refresh
+          </Button>
+          <div className="flex items-center gap-2 px-4 py-2 bg-red-50 text-red-700 rounded-xl text-sm font-medium border border-red-200">
+            <AlertCircle className="w-4 h-4" />
+            {alerts.filter((a) => a.status === 'active').length} Active
+          </div>
         </div>
       </div>
 

@@ -1,8 +1,8 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
-import { AlertCircle, TrendingUp, Droplet, Zap, Activity, Waves, AlertTriangle } from 'lucide-react';
+import { AlertCircle, TrendingUp, Droplet, Zap, Activity, Waves, AlertTriangle, RefreshCw } from 'lucide-react';
 import { DashboardMetrics, Alert } from '@/lib/types';
 import { KPICard } from '@/components/dashboard/kpi-card';
 import { AlertFeed } from '@/components/dashboard/alert-feed';
@@ -11,6 +11,7 @@ import { PressureHeatmap } from '@/components/dashboard/pressure-heatmap';
 import { PipelineNetworkGraph } from '@/components/dashboard/pipeline-network-graph';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Eye, Brain } from 'lucide-react';
+import { backendService, DerivedMetrics, DerivedAlert } from '@/lib/backend-service';
 
 // Types for pipeline data
 interface RiskNode {
@@ -55,15 +56,15 @@ interface NetworkData {
   edges: GraphEdge[];
 }
 
-// Mock data
-const mockMetrics: DashboardMetrics = {
-  total_water_loss: 4250,
-  total_water_loss_percentage: 12.5,
-  critical_alerts: 3,
-  active_leaks: 7,
-  sensor_health_percentage: 94,
-  zones_with_issues: 2,
-  avg_water_loss_24h: 3890,
+// Default metrics (used before data loads)
+const defaultMetrics: DashboardMetrics = {
+  total_water_loss: 0,
+  total_water_loss_percentage: 0,
+  critical_alerts: 0,
+  active_leaks: 0,
+  sensor_health_percentage: 100,
+  zones_with_issues: 0,
+  avg_water_loss_24h: 0,
 };
 
 const mockChartData = [
@@ -76,48 +77,79 @@ const mockChartData = [
   { time: '23:59', loss: 2100, expected: 2100 },
 ];
 
-const mockAnomalyData = [
-  { name: 'Normal', value: 85, color: '#06b6d4' },
-  { name: 'Anomaly', value: 10, color: '#f97316' },
-  { name: 'Critical', value: 5, color: '#ef4444' },
-];
-
-const mockAlerts: Alert[] = [
-  {
-    id: '1',
-    alert_type: 'leak_detected',
-    severity: 'critical',
-    status: 'active',
-    description: 'High-pressure leak detected in Zone A-2',
-    location: 'Main Pipeline - Sector 2',
-    estimated_loss: 850,
-    created_at: new Date(Date.now() - 5 * 60000).toISOString(),
-  },
-  {
-    id: '2',
-    alert_type: 'pressure_drop',
-    severity: 'high',
-    status: 'active',
-    description: 'Unusual pressure drop detected',
-    location: 'Secondary Line - Sector 5',
-    created_at: new Date(Date.now() - 15 * 60000).toISOString(),
-  },
-  {
-    id: '3',
-    alert_type: 'flow_anomaly',
-    severity: 'medium',
-    status: 'acknowledged',
-    description: 'Flow rate exceeds expected parameters',
-    location: 'Zone C-1',
-    created_at: new Date(Date.now() - 45 * 60000).toISOString(),
-  },
-];
-
 export default function DashboardPage() {
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
   const [pipelineData, setPipelineData] = useState<PipelineData | null>(null);
   const [pressureChartData, setPressureChartData] = useState<{ node: string; pressure: number }[]>([]);
   const [networkData, setNetworkData] = useState<NetworkData | null>(null);
+  const [metrics, setMetrics] = useState<DashboardMetrics>(defaultMetrics);
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [anomalyData, setAnomalyData] = useState([
+    { name: 'Normal', value: 85, color: '#06b6d4' },
+    { name: 'Anomaly', value: 10, color: '#f97316' },
+    { name: 'Critical', value: 5, color: '#ef4444' },
+  ]);
+  const [modelMetrics, setModelMetrics] = useState<{accuracy?: number; precision?: number; recall?: number; f1?: number}>({});
+
+  // Fetch all dashboard data from backend
+  const fetchDashboardData = useCallback(async () => {
+    try {
+      // Fetch metrics from backend
+      const backendMetrics = await backendService.getMetrics();
+      setMetrics({
+        total_water_loss: backendMetrics.total_water_loss,
+        total_water_loss_percentage: backendMetrics.total_water_loss_percentage,
+        critical_alerts: backendMetrics.critical_alerts,
+        active_leaks: backendMetrics.active_leaks,
+        sensor_health_percentage: backendMetrics.sensor_health_percentage,
+        zones_with_issues: backendMetrics.zones_with_issues,
+        avg_water_loss_24h: backendMetrics.avg_water_loss_24h,
+      });
+
+      // Store model metrics
+      setModelMetrics({
+        accuracy: backendMetrics.model_accuracy,
+        precision: backendMetrics.model_precision,
+        recall: backendMetrics.model_recall,
+        f1: backendMetrics.model_f1,
+      });
+
+      // Fetch alerts from backend
+      const backendAlerts = await backendService.getAlerts();
+      setAlerts(backendAlerts.map(a => ({
+        id: a.id,
+        zone_id: a.zone_id,
+        sensor_id: a.sensor_id,
+        alert_type: a.alert_type,
+        severity: a.severity,
+        status: a.status,
+        description: a.description,
+        location: a.location,
+        estimated_loss: a.estimated_loss,
+        created_at: a.created_at,
+        acknowledged_at: a.acknowledged_at,
+        resolved_at: a.resolved_at,
+      })));
+
+      // Calculate anomaly distribution based on current data
+      const snapshot = backendService.getLatestSnapshot();
+      if (snapshot) {
+        const totalNodes = snapshot.nodes.length;
+        const criticalCount = snapshot.nodes.filter(n => n.is_leaking === 1).length;
+        const anomalyCount = snapshot.nodes.filter(n => !n.is_leaking && (n.pred_leak_prob || 0) > 0.3).length;
+        const normalCount = totalNodes - criticalCount - anomalyCount;
+
+        setAnomalyData([
+          { name: 'Normal', value: Math.round((normalCount / totalNodes) * 100), color: '#06b6d4' },
+          { name: 'Anomaly', value: Math.round((anomalyCount / totalNodes) * 100), color: '#f97316' },
+          { name: 'Critical', value: Math.round((criticalCount / totalNodes) * 100), color: '#ef4444' },
+        ]);
+      }
+
+    } catch (error) {
+      console.error('Failed to fetch dashboard data from backend:', error);
+    }
+  }, []);
 
   // Fetch pipeline pressure data from backend API
   useEffect(() => {
@@ -235,13 +267,17 @@ export default function DashboardPage() {
     };
 
     fetchPipelineData();
-    const interval = setInterval(fetchPipelineData, 5000);
+    fetchDashboardData(); // Also fetch metrics and alerts
+    const interval = setInterval(() => {
+      fetchPipelineData();
+      fetchDashboardData();
+    }, 5000);
     
     return () => clearInterval(interval);
-  }, []);
+  }, [fetchDashboardData]);
 
   useEffect(() => {
-    // Simulate fetching data
+    // Initial load complete
     setIsLoading(false);
   }, []);
 
@@ -257,39 +293,39 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <KPICard
           title="Water Loss"
-          value={`${mockMetrics.total_water_loss} m³`}
-          change={mockMetrics.total_water_loss_percentage}
+          value={`${metrics.total_water_loss.toLocaleString()} m³`}
+          change={metrics.total_water_loss_percentage}
           unit="%"
           icon={Droplet}
-          trend="up"
-          status="warning"
+          trend={metrics.total_water_loss_percentage > 10 ? "up" : "down"}
+          status={metrics.total_water_loss_percentage > 15 ? "critical" : metrics.total_water_loss_percentage > 10 ? "warning" : "success"}
         />
         <KPICard
           title="Critical Alerts"
-          value={mockMetrics.critical_alerts}
-          change={2}
+          value={metrics.critical_alerts}
+          change={metrics.critical_alerts}
           unit="active"
           icon={AlertCircle}
-          trend="down"
-          status="critical"
+          trend={metrics.critical_alerts > 0 ? "up" : "down"}
+          status={metrics.critical_alerts > 5 ? "critical" : metrics.critical_alerts > 0 ? "warning" : "success"}
         />
         <KPICard
           title="Active Leaks"
-          value={mockMetrics.active_leaks}
-          change={1}
+          value={metrics.active_leaks}
+          change={metrics.active_leaks}
           unit="sites"
           icon={Zap}
-          trend="up"
-          status="warning"
+          trend={metrics.active_leaks > 0 ? "up" : "down"}
+          status={metrics.active_leaks > 3 ? "critical" : metrics.active_leaks > 0 ? "warning" : "success"}
         />
         <KPICard
           title="Sensor Health"
-          value={`${mockMetrics.sensor_health_percentage}%`}
-          change={2}
+          value={`${metrics.sensor_health_percentage}%`}
+          change={100 - metrics.sensor_health_percentage}
           unit="operational"
           icon={TrendingUp}
-          trend="down"
-          status="success"
+          trend={metrics.sensor_health_percentage >= 90 ? "down" : "up"}
+          status={metrics.sensor_health_percentage >= 90 ? "success" : metrics.sensor_health_percentage >= 75 ? "warning" : "critical"}
         />
       </div>
 
@@ -402,7 +438,7 @@ export default function DashboardPage() {
             <ResponsiveContainer width="100%" height={200}>
               <PieChart>
                 <Pie
-                  data={mockAnomalyData}
+                  data={anomalyData}
                   cx="50%"
                   cy="50%"
                   innerRadius={50}
@@ -410,7 +446,7 @@ export default function DashboardPage() {
                   paddingAngle={3}
                   dataKey="value"
                 >
-                  {mockAnomalyData.map((entry, index) => (
+                  {anomalyData.map((entry, index) => (
                     <Cell key={`cell-${index}`} fill={entry.color} />
                   ))}
                 </Pie>
@@ -418,7 +454,7 @@ export default function DashboardPage() {
             </ResponsiveContainer>
           </div>
           <div className="space-y-2 mt-4">
-            {mockAnomalyData.map((item) => (
+            {anomalyData.map((item) => (
               <div key={item.name} className="flex items-center justify-between text-sm">
                 <div className="flex items-center gap-2">
                   <div className="w-3 h-3 rounded-full" style={{ backgroundColor: item.color }} />
@@ -428,6 +464,30 @@ export default function DashboardPage() {
               </div>
             ))}
           </div>
+          {/* Model Metrics */}
+          {modelMetrics.accuracy !== undefined && (
+            <div className="mt-4 pt-4 border-t border-slate-200">
+              <p className="text-xs text-slate-500 mb-2">Model Performance</p>
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Accuracy:</span>
+                  <span className="font-medium text-slate-700">{(modelMetrics.accuracy! * 100).toFixed(1)}%</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Precision:</span>
+                  <span className="font-medium text-slate-700">{modelMetrics.precision ? (modelMetrics.precision * 100).toFixed(1) : 'N/A'}%</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Recall:</span>
+                  <span className="font-medium text-slate-700">{modelMetrics.recall ? (modelMetrics.recall * 100).toFixed(1) : 'N/A'}%</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">F1 Score:</span>
+                  <span className="font-medium text-slate-700">{modelMetrics.f1 ? (modelMetrics.f1 * 100).toFixed(1) : 'N/A'}%</span>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -435,7 +495,7 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <MiniMap />
         <div className="lg:col-span-2">
-          <AlertFeed alerts={mockAlerts} />
+          <AlertFeed alerts={alerts} />
         </div>
       </div>
 

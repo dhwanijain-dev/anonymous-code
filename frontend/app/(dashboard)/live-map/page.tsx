@@ -1,12 +1,14 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import dynamic from 'next/dynamic';
 import type { ComponentType } from 'react';
 import { Input } from '@/components/ui/input';
-import { MapPin, AlertCircle, Droplet, Activity, Battery, Radio, Search } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { MapPin, AlertCircle, Droplet, Activity, Battery, Radio, Search, RefreshCw } from 'lucide-react';
 import { Sensor } from '@/lib/types';
 import { cn } from '@/lib/utils';
+import { backendService, DerivedSensor } from '@/lib/backend-service';
 
 interface FullMapProps {
   sensors: Sensor[];
@@ -32,77 +34,34 @@ const FullLeafletMap = dynamic<FullMapProps>(
   }
 );
 
-// Mock sensor data
-const mockSensors: Sensor[] = [
-  {
-    id: '1',
-    zone_id: 'zone-a',
-    name: 'Main Inlet - A1',
-    sensor_type: 'flow',
-    coordinates: { latitude: 40.7128, longitude: -74.006 },
-    status: 'active',
-    battery_level: 92,
-    installation_date: '2024-01-15',
-    created_at: '2024-01-15',
-    updated_at: '2024-02-26',
-    last_reading: {
-      id: '1',
-      sensor_id: '1',
-      value: 125.4,
-      unit: 'L/min',
-      timestamp: new Date().toISOString(),
-      is_anomaly: false,
-    },
-  },
-  {
-    id: '2',
-    zone_id: 'zone-b',
-    name: 'Secondary Line - B2',
-    sensor_type: 'pressure',
-    coordinates: { latitude: 40.7138, longitude: -74.016 },
-    status: 'active',
-    battery_level: 78,
-    installation_date: '2024-01-20',
-    created_at: '2024-01-20',
-    updated_at: '2024-02-26',
-    last_reading: {
-      id: '2',
-      sensor_id: '2',
-      value: 3.8,
-      unit: 'bar',
-      timestamp: new Date().toISOString(),
-      is_anomaly: true,
-    },
-  },
-  {
-    id: '3',
-    zone_id: 'zone-c',
-    name: 'Leak Detection - C1',
-    sensor_type: 'leak_detection',
-    coordinates: { latitude: 40.7118, longitude: -73.996 },
-    status: 'active',
-    battery_level: 85,
-    installation_date: '2024-02-01',
-    created_at: '2024-02-01',
-    updated_at: '2024-02-26',
-    last_reading: {
-      id: '3',
-      sensor_id: '3',
-      value: 0,
-      unit: 'status',
-      timestamp: new Date().toISOString(),
-      is_anomaly: false,
-    },
-  },
-];
-
 export default function LiveMapPage() {
+  const [sensors, setSensors] = useState<Sensor[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
   const [selectedSensor, setSelectedSensor] = useState<Sensor | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
 
-  const filteredSensors = mockSensors.filter(
+  // Fetch sensors from backend
+  const fetchSensors = useCallback(async () => {
+    try {
+      const backendSensors = await backendService.getSensors();
+      setSensors(backendSensors as Sensor[]);
+      setIsLoading(false);
+    } catch (error) {
+      console.error('Failed to fetch sensors for map:', error);
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSensors();
+    const interval = setInterval(fetchSensors, 5000);
+    return () => clearInterval(interval);
+  }, [fetchSensors]);
+
+  const filteredSensors = sensors.filter(
     (sensor) =>
       sensor.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      sensor.id.toLowerCase().includes(searchTerm.toLowerCase()) ||
       sensor.zone_id.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
@@ -135,9 +94,20 @@ export default function LiveMapPage() {
   return (
     <div className="p-6 space-y-6">
       {/* Header */}
-      <div>
-        <h1 className="text-3xl font-bold text-slate-900">Live Map</h1>
-        <p className="text-slate-500 mt-1">Real-time sensor locations and status</p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-3xl font-bold text-slate-900">Live Map</h1>
+          <p className="text-slate-500 mt-1">Real-time sensor locations and status (Network nodes)</p>
+        </div>
+        <Button
+          onClick={fetchSensors}
+          variant="outline"
+          size="sm"
+          className="flex items-center gap-2"
+        >
+          <RefreshCw className={cn("w-4 h-4", isLoading && "animate-spin")} />
+          Refresh
+        </Button>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -145,7 +115,7 @@ export default function LiveMapPage() {
         <div className="lg:col-span-2">
           <div className="bg-white/80 backdrop-blur-sm rounded-2xl border border-slate-200 shadow-lg h-96 overflow-hidden">
             <FullLeafletMap 
-              sensors={mockSensors}
+              sensors={sensors}
               selectedSensor={selectedSensor}
               onSensorSelect={setSelectedSensor}
             />

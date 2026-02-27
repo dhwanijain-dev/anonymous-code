@@ -1,8 +1,9 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
 import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
 import {
   Select,
   SelectContent,
@@ -10,101 +11,39 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Activity, Droplet, AlertCircle, MapPin, Battery, ChevronRight, Search, Cpu } from 'lucide-react';
+import { Activity, Droplet, AlertCircle, MapPin, Battery, ChevronRight, Search, Cpu, RefreshCw } from 'lucide-react';
 import { Sensor } from '@/lib/types';
 import { cn } from '@/lib/utils';
-
-// Mock data
-const mockSensors: Sensor[] = [
-  {
-    id: '1',
-    zone_id: 'zone-a',
-    name: 'Main Inlet - A1',
-    sensor_type: 'flow',
-    coordinates: { latitude: 40.7128, longitude: -74.006 },
-    status: 'active',
-    battery_level: 92,
-    installation_date: '2024-01-15',
-    created_at: '2024-01-15',
-    updated_at: '2024-02-26',
-    last_reading: {
-      id: '1',
-      sensor_id: '1',
-      value: 125.4,
-      unit: 'L/min',
-      timestamp: new Date().toISOString(),
-      is_anomaly: false,
-    },
-  },
-  {
-    id: '2',
-    zone_id: 'zone-b',
-    name: 'Secondary Line - B2',
-    sensor_type: 'pressure',
-    coordinates: { latitude: 40.7138, longitude: -74.016 },
-    status: 'active',
-    battery_level: 78,
-    installation_date: '2024-01-20',
-    created_at: '2024-01-20',
-    updated_at: '2024-02-26',
-    last_reading: {
-      id: '2',
-      sensor_id: '2',
-      value: 3.8,
-      unit: 'bar',
-      timestamp: new Date().toISOString(),
-      is_anomaly: true,
-    },
-  },
-  {
-    id: '3',
-    zone_id: 'zone-c',
-    name: 'Leak Detection - C1',
-    sensor_type: 'leak_detection',
-    coordinates: { latitude: 40.7118, longitude: -73.996 },
-    status: 'active',
-    battery_level: 85,
-    installation_date: '2024-02-01',
-    created_at: '2024-02-01',
-    updated_at: '2024-02-26',
-    last_reading: {
-      id: '3',
-      sensor_id: '3',
-      value: 0,
-      unit: 'status',
-      timestamp: new Date().toISOString(),
-      is_anomaly: false,
-    },
-  },
-  {
-    id: '4',
-    zone_id: 'zone-a',
-    name: 'Pressure Monitor - A3',
-    sensor_type: 'pressure',
-    coordinates: { latitude: 40.7108, longitude: -74.026 },
-    status: 'active',
-    battery_level: 65,
-    installation_date: '2024-01-25',
-    created_at: '2024-01-25',
-    updated_at: '2024-02-26',
-    last_reading: {
-      id: '4',
-      sensor_id: '4',
-      value: 4.2,
-      unit: 'bar',
-      timestamp: new Date().toISOString(),
-      is_anomaly: false,
-    },
-  },
-];
+import { backendService, DerivedSensor } from '@/lib/backend-service';
 
 export default function SensorsPage() {
+  const [sensors, setSensors] = useState<Sensor[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterType, setFilterType] = useState<string>('all');
   const [filterStatus, setFilterStatus] = useState<string>('all');
 
-  const filteredSensors = mockSensors.filter((sensor) => {
-    const matchSearch = sensor.name.toLowerCase().includes(searchTerm.toLowerCase());
+  // Fetch sensors from backend
+  const fetchSensors = useCallback(async () => {
+    try {
+      const backendSensors = await backendService.getSensors();
+      setSensors(backendSensors as Sensor[]);
+      setIsLoading(false);
+    } catch (error) {
+      console.error('Failed to fetch sensors:', error);
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSensors();
+    const interval = setInterval(fetchSensors, 5000);
+    return () => clearInterval(interval);
+  }, [fetchSensors]);
+
+  const filteredSensors = sensors.filter((sensor) => {
+    const matchSearch = sensor.name.toLowerCase().includes(searchTerm.toLowerCase()) || 
+                       sensor.id.toLowerCase().includes(searchTerm.toLowerCase());
     const matchType = filterType === 'all' || sensor.sensor_type === filterType;
     const matchStatus = filterStatus === 'all' || sensor.status === filterStatus;
     return matchSearch && matchType && matchStatus;
@@ -156,11 +95,22 @@ export default function SensorsPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold text-slate-900">Sensors</h1>
-          <p className="text-slate-500 mt-1">Manage and monitor all sensors in the network</p>
+          <p className="text-slate-500 mt-1">Manage and monitor all sensors (Network nodes)</p>
         </div>
-        <div className="flex items-center gap-2 px-4 py-2 bg-blue-50 text-blue-700 rounded-xl text-sm font-medium border border-blue-200">
-          <Cpu className="w-4 h-4" />
-          {mockSensors.filter((s) => s.status === 'active').length} Online
+        <div className="flex items-center gap-3">
+          <Button
+            onClick={fetchSensors}
+            variant="outline"
+            size="sm"
+            className="flex items-center gap-2"
+          >
+            <RefreshCw className={cn("w-4 h-4", isLoading && "animate-spin")} />
+            Refresh
+          </Button>
+          <div className="flex items-center gap-2 px-4 py-2 bg-blue-50 text-blue-700 rounded-xl text-sm font-medium border border-blue-200">
+            <Cpu className="w-4 h-4" />
+            {sensors.filter((s) => s.status === 'active').length} Online
+          </div>
         </div>
       </div>
 

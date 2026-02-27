@@ -19,10 +19,26 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# BIWS network for live simulation (retrained models are based on this network).
 INP_FILE = os.path.join(BASE_DIR, "BIWS.inp")
+
 HTML_FILE = os.path.join(BASE_DIR, "../frontend/dashboard.html")
-CSV_FILE = os.path.join(BASE_DIR, "simulation_data.csv")
-MODEL_FILE = os.path.join(BASE_DIR, "model", "xgboost_leak_model.pkl")
+
+# Pre-trained models (provided separately)
+DETECTION_MODEL_FILE = os.path.join(BASE_DIR, "model", "detection.pkl")
+PREDICTION_MODEL_FILE = os.path.join(BASE_DIR, "model", "prediction.pkl")
+
+# ============================
+# MODEL FEATURE SCHEMA
+# ============================
+# The BIWS junction node IDs in the exact order produced by prediction_data.py
+# when building the training dataset from BiWSData/ scenarios.
+# Loaded dynamically from the network at startup so it always stays in sync.
+# Both detection.pkl and prediction.pkl expect pressures in this order.
+_wn_schema = wntr.network.WaterNetworkModel(INP_FILE)
+BIWS_NODE_ORDER: List[str] = [str(n).strip() for n in _wn_schema.junction_name_list]
+N_MODEL_FEATURES: int = len(BIWS_NODE_ORDER)   # 2859 for BIWS
 
 # ============================
 # APP
@@ -46,13 +62,23 @@ wn_init = wntr.network.WaterNetworkModel(INP_FILE)
 node_physical_props = {}
 pipe_physical_props = {}
 
+# Detection model (current leak classification)
 leak_model = None
 try:
-    leak_model = joblib.load(MODEL_FILE)
-    print(f"Loaded XGBoost model from: {MODEL_FILE}")
+    leak_model = joblib.load(DETECTION_MODEL_FILE)
+    print(f"Loaded detection model from: {DETECTION_MODEL_FILE}")
 except Exception as e:
-    print(f"WARNING: Failed to load leak model at {MODEL_FILE}: {e}")
+    print(f"WARNING: Failed to load detection model at {DETECTION_MODEL_FILE}: {e}")
     leak_model = None
+
+# Prediction model (future leak forecasting at network level)
+prediction_model = None
+try:
+    prediction_model = joblib.load(PREDICTION_MODEL_FILE)
+    print(f"Loaded prediction model from: {PREDICTION_MODEL_FILE}")
+except Exception as e:
+    print(f"WARNING: Failed to load prediction model at {PREDICTION_MODEL_FILE}: {e}")
+    prediction_model = None
 
 for node in wn_init.junction_name_list:
     node_physical_props[node] = {
@@ -120,49 +146,40 @@ def _predict_nodes(
     Predict node leak probabilities using the trained XGBoost model.
     Returns (prob_by_node_id, pred_by_node_id).
     """
-    if leak_model is None:
-        return {}, {}
+    # NOTE: This helper is no longer used for per-node features. The detection
+    # model (detection.pkl) is trained on full-network snapshots (Net1OK), and
+    # in the simulation loop we now apply it at the network level instead.
+    return {}, {}
 
-    rows = []
-    ids = []
-    for n in nodes:
-        node_id = str(n.get("id", "")).strip()
-        if not node_id:
-            continue
-        props = node_physical_props.get(node_id)
-        if props is None:
-            # For dynamically-created nodes (e.g., pipe-split leak junctions), we skip if no props
-            continue
-        ids.append(node_id)
-        rows.append(
-            {
-                "age": props.get("age", 0.0),
-                "corrosion_idx": props.get("corrosion_idx", 0.0),
-                "length": props.get("length", 0.0),
-                # model.py trained on 'baseline_pressure' column; our props store avg_pressure
-                "baseline_pressure": props.get("avg_pressure", 0.0),
-                "press_var": props.get("press_var", 0.0),
-                "soil_corr_idx": props.get("soil_corr_idx", 0.0),
-                "current_live_pressure": n.get("pressure", 0.0),
-            }
-        )
 
-    if not rows:
-        return {}, {}
+def _build_model_feature_vector(
+    graph_nodes: List[Dict[str, Any]],
+    active_leak_junctions: Optional[set] = None,
+) -> np.ndarray:
+    """
+    Build the N_MODEL_FEATURES-dimensional feature vector that both
+    detection.pkl and prediction.pkl expect, matching the schema produced by
+    prediction_data.py when trained on BiWSData/:
 
-    X = pd.DataFrame(rows).fillna(0.0)
-    try:
-        proba = leak_model.predict_proba(X)[:, 1]
-    except Exception:
-        # Some models may not support predict_proba; fall back to predict
-        preds = leak_model.predict(X)
-        prob_by_id = {i: float(p) for i, p in zip(ids, preds)}
-        pred_by_id = {i: int(p >= threshold) for i, p in zip(ids, preds)}
-        return prob_by_id, pred_by_id
+      columns 0 .. N_MODEL_FEATURES-1 : live pressures for every BIWS junction
+        in the order stored in BIWS_NODE_ORDER (= wn.junction_name_list order).
+        Any junction not present in the live snapshot gets pressure 0.0.
 
-    prob_by_id = {i: float(p) for i, p in zip(ids, proba)}
-    pred_by_id = {i: int(p >= threshold) for i, p in zip(ids, proba)}
-    return prob_by_id, pred_by_id
+    Args:
+        graph_nodes: list of node dicts from the live simulation snapshot, each
+                     with keys 'id' and 'pressure'.
+        active_leak_junctions: unused for BIWS (kept for API compatibility).
+
+    Returns:
+        numpy array of shape (1, N_MODEL_FEATURES), dtype float32.
+    """
+    # Build a fast lookup: node_id -> pressure
+    pressure_map: Dict[str, float] = {
+        str(n["id"]).strip(): float(n["pressure"]) for n in graph_nodes
+    }
+    # Map every BIWS junction in training-column order; 0.0 if not in snapshot
+    feats = [pressure_map.get(nid, 0.0) for nid in BIWS_NODE_ORDER]
+    return np.array(feats, dtype=np.float32).reshape(1, -1)
 
 
 def extract_graph_edges(wn, results=None, active_pipe_leaks: Optional[set] = None):
@@ -361,18 +378,32 @@ def simulation_worker():
             # Extract edges (pipes / pumps / valves)
             graph_edges = extract_graph_edges(wn, results, active_pipe_leaks=active_pipe_leaks)
 
-            # Model predictions (nodes)
-            prob_by_node, pred_by_node = _predict_nodes(graph_nodes, threshold=0.5)
-            for n in graph_nodes:
-                nid = str(n.get("id", "")).strip()
-                if nid in prob_by_node:
-                    n["pred_leak_prob"] = prob_by_node[nid]
-                    n["pred_is_leaking"] = pred_by_node[nid]
-                else:
-                    n["pred_leak_prob"] = None
-                    n["pred_is_leaking"] = None
+            # ------------------------------------------------------------------
+            # Network-level leak DETECTION using detection.pkl
+            # Feature schema: NET1_NODE_ORDER pressures + leak_node0/1 pressures
+            # (13 features total, matching prediction_data.build_dataset output)
+            # ------------------------------------------------------------------
+            det_prob = None
+            det_flag = None
+            if leak_model is not None and len(graph_nodes) > 0:
+                try:
+                    X_det = _build_model_feature_vector(graph_nodes, active_leaks)
+                    try:
+                        det_prob = float(leak_model.predict_proba(X_det)[0, 1])
+                    except Exception:
+                        det_prob = float(leak_model.predict(X_det)[0])
+                    det_flag = int(det_prob >= 0.5)
+                except Exception as ex:
+                    print(f"Detection model inference error: {ex}")
+                    det_prob = None
+                    det_flag = None
 
-            # Model predictions (pipes): approximate from endpoint node probabilities
+            # Attach the same network-level detection result to every node
+            for n in graph_nodes:
+                n["pred_leak_prob"] = det_prob
+                n["pred_is_leaking"] = det_flag
+
+            # Pipe-level prediction: inherit the max of the two endpoint node probs
             node_prob_map = {str(n["id"]).strip(): n.get("pred_leak_prob") for n in graph_nodes}
             for e in graph_edges:
                 u = str(e.get("from", "")).strip()
@@ -390,6 +421,28 @@ def simulation_worker():
             pipe_y_true = [int(e.get("is_leaking", 0)) for e in graph_edges if e.get("pred_is_leaking") is not None]
             pipe_y_pred = [int(e.get("pred_is_leaking", 0)) for e in graph_edges if e.get("pred_is_leaking") is not None]
 
+            # ------------------------------------------------------------------
+            # Future leak PREDICTION using prediction.pkl
+            # Same 13-feature schema as the detection model.
+            # prediction.pkl was trained on the same Net1OK dataset but with
+            # different hyperparameters (n_estimators=200, lr=0.05) to serve as
+            # a complementary forward-looking risk score.
+            # ------------------------------------------------------------------
+            future_prob = None
+            future_flag = None
+            if prediction_model is not None and graph_nodes:
+                try:
+                    X_future = _build_model_feature_vector(graph_nodes, active_leaks)
+                    try:
+                        future_prob = float(prediction_model.predict_proba(X_future)[0, 1])
+                    except Exception:
+                        future_prob = float(prediction_model.predict(X_future)[0])
+                    future_flag = int(future_prob >= 0.5)
+                except Exception as ex:
+                    print(f"Prediction model inference error: {ex}")
+                    future_prob = None
+                    future_flag = None
+
             snapshot = {
                 "nodes": graph_nodes,
                 "edges": graph_edges,
@@ -398,11 +451,13 @@ def simulation_worker():
                     "pipes": _binary_metrics(pipe_y_true, pipe_y_pred),
                     "model_loaded": bool(leak_model is not None),
                 },
+                "prediction": {
+                    "future_leak_prob": future_prob,
+                    "future_leak_flag": future_flag,
+                    "model_loaded": bool(prediction_model is not None),
+                },
                 "timestamp": current_time
             }
-            print(graph_nodes[0])
-            print(graph_edges[0])
-            print(current_time)
             stream_buffer.clear()
             stream_buffer.append(snapshot)
 

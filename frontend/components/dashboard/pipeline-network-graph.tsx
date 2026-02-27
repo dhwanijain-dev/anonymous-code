@@ -380,6 +380,7 @@ export function PipelineNetworkGraph({ nodes: graphNodes, edges: graphEdges, isL
           }}
         >
           <Background color="#e2e8f0" gap={20} />
+          
           <Controls 
             position="bottom-right"
             style={{ 
